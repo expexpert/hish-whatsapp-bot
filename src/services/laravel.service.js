@@ -42,8 +42,16 @@ class LaravelService {
     console.log(`📊 Fetching Dashboard Data for ${phone} (Hybrid Mode)...`);
     
     try {
+      const now = new Date();
+      const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
+      const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().split('T')[0];
+
       const response = await axios.get(`${this.baseUrl}/customer/dashboard-data`, {
-        headers: this.getBotHeaders(phone)
+        headers: this.getBotHeaders(phone),
+        params: {
+          date_from: startOfMonth,
+          date_to: endOfMonth
+        }
       });
       const data = response.data.data;
       
