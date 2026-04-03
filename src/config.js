@@ -14,6 +14,6 @@ module.exports = {
     apiKey: process.env.OPENAI_API_KEY || null
   },
   botPublicUrl: process.env.BOT_PUBLIC_URL || 'https://loura-dismal-electrovalently.ngrok-free.dev',
-  botSecret: process.env.WHATSAPP_BOT_SECRET || 'super-secret',
+  botSecret: process.env.WHATSAPP_BOT_SECRET,
   storageDir: process.env.STORAGE_DIR || '/tmp/whatsapp-bot-storage'
 };

@@ -4,7 +4,7 @@ class LaravelService {
   constructor() {
     this.baseUrl = (process.env.LARAVEL_API_URL || 'http://localhost:8000/api') + '/bot';
     this.publicUrl = process.env.LARAVEL_PUBLIC_URL || 'http://localhost:8000';
-    this.botSecret = process.env.WHATSAPP_BOT_SECRET || '69c932e7409a99b491c44789314ae787';
+    this.botSecret = process.env.WHATSAPP_BOT_SECRET ;
   }
 
   getBotHeaders(phone = null) {
