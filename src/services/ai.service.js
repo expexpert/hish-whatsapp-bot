@@ -41,6 +41,7 @@ class AIService {
                       catList +
                       "Try to match with 'Available Categories'. If no match, suggest a simple/logical new category (e.g., Food, Travel, Supplies). Do NOT use 'General' if a better inference exists. " +
                       "Classify as 'EXPENSE' (receipt), 'STATEMENT' (bank summary), or 'INVOICE' (sales/income). " + 
+                      "Extract the Supplier (for expenses) or Client (for invoices) name into 'entity'. This is CRITICAL: If you see a company name like 'ABC Consulting', 'Google', or any entity mentioned as the recipient/source, put it in 'entity'. " + 
                       "Output JSON only: { documentType, amount, vat, currency, category, entity, description, monthYear (for statements, MM-YYYY format), payment_method, date (YYYY-MM-DD) }." 
           },
           { role: "user", content: text }

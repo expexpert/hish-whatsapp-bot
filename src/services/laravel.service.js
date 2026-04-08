@@ -2,7 +2,7 @@ const axios = require('axios');
 
 class LaravelService {
   constructor() {
-    this.baseUrl = (process.env.LARAVEL_API_URL || 'http://localhost:8000/api') + '/bot/customer';
+    this.baseUrl = (process.env.LARAVEL_API_URL || 'http://localhost:8000/api') + '/bot';
     this.publicUrl = process.env.LARAVEL_PUBLIC_URL || 'http://localhost:8000';
     this.botSecret = process.env.WHATSAPP_BOT_SECRET ;
   }

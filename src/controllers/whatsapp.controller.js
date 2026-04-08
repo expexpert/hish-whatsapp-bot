@@ -128,14 +128,17 @@ class WhatsAppController {
 
         // Check for Menu Triggers
         if (textLower === 'record expense') {
+          stateService.setUserState(from, 'AWAITING_EXPENSE_DATA');
           await whatsappService.sendTextMessage(from, "Please provide the expense details or upload a receipt photo/audio note.\nExample: '150.00 for office supplies'");
           return;
         }
         if (textLower === 'record invoice') {
+          stateService.setUserState(from, 'AWAITING_INVOICE_DATA');
           await whatsappService.sendTextMessage(from, "Please provide the invoice details or upload the document (PDF/Image).\nExample: '500.00 invoice for ABC Consulting'");
           return;
         }
         if (textLower === 'upload statement') {
+          stateService.setUserState(from, 'AWAITING_STATEMENT_DATA');
           await whatsappService.sendTextMessage(from, "Please upload your Bank Statement in PDF format.");
           return;
         }
@@ -155,16 +158,15 @@ class WhatsAppController {
             let feedback = "*Record Saved Successfully*";
             
             if (state.data.receiptPath) {
-              feedback += "\nYour document has been synchronized with the portal.";
-              let finalUrl = result.file_url;
-              if (state.data.receiptPath) {
-                const path = require('path');
-                const fileName = path.basename(state.data.receiptPath);
-                finalUrl = `${config.botPublicUrl}/storage/${fileName}`;
-              }
+              const fileName = path.basename(state.data.receiptPath);
+              const isAudio = fileName.endsWith('.ogg');
               
-              if (finalUrl) {
+              if (!isAudio) {
+                feedback += "\nYour document has been synchronized with the portal.";
+                let finalUrl = result.file_url || `${config.botPublicUrl}/storage/${fileName}`;
                 feedback += `\n\nView Document: ${finalUrl}`;
+              } else {
+                feedback += "\nYour voice note has been processed and saved.";
               }
             } else {
               feedback += "\nYour accountant has been notified. You may provide a receipt at a later time.";
@@ -255,9 +257,10 @@ class WhatsAppController {
             state.state === 'AWAITING_PAYMENT_METHOD_EDIT' ||
             state.state === 'AWAITING_AMOUNT_EDIT_INVOICE' || state.state === 'AWAITING_DESCRIPTION_EDIT_INVOICE' || 
             state.state === 'AWAITING_CATEGORY_EDIT_INVOICE' || state.state === 'AWAITING_PAYMENT_METHOD_EDIT_INVOICE' || 
-            state.state === 'AWAITING_DATE_EDIT' || state.state === 'AWAITING_DATE_EDIT_INVOICE') {
+            state.state === 'AWAITING_DATE_EDIT' || state.state === 'AWAITING_DATE_EDIT_INVOICE' ||
+            state.state === 'AWAITING_INVOICE_DATE') {
             
-            const isInvoice = state.state.endsWith('_INVOICE');
+            const isInvoice = state.state.endsWith('_INVOICE') || state.state === 'AWAITING_INVOICE_DATE';
             const dataObj = isInvoice ? state.data.invoiceData : state.data.expenseData;
 
             if (state.state.startsWith('AWAITING_AMOUNT_EDIT') || state.state === 'AWAITING_INVOICE_DATE') {
@@ -275,6 +278,7 @@ class WhatsAppController {
                 dataObj.category = text;
             } else if (state.state === 'AWAITING_ENTITY_EDIT') {
                 dataObj.entity = text;
+                return this.handleDocumentRouting(from, dataObj, state.data.receiptPath, 'text');
             } else if (state.state === 'AWAITING_PAYMENT_METHOD_EDIT' || state.state === 'AWAITING_PAYMENT_METHOD_EDIT_INVOICE') {
                 dataObj.payment_method = interactiveId || text;
             }
@@ -298,26 +302,11 @@ class WhatsAppController {
         // --- Handle Statement Month Confirmation ---
         if (state.state === 'AWAITING_STATEMENT_MONTH') {
             const monthYear = text;
-            
-            if (!state.data.filePath) {
-                // If no file was provided yet, keep the state but remind them to upload the PDF
-                state.data.monthYear = monthYear; // Save the month for later
-                stateService.setUserState(from, 'AWAITING_STATEMENT_FILE', state.data);
-                await whatsappService.sendTextMessage(from, `Got it. Statement for ${monthYear}.\n\n📎 Please upload the PDF or Image of the statement to complete the record.`);
-                return;
-            }
-
-            await whatsappService.sendTextMessage(from, `Processing statement for ${monthYear}...`);
-            await laravelService.uploadStatement(state.data.filePath, from, monthYear);
-            await whatsappService.sendTextMessage(from, "Bank statement successfully uploaded to the portal.");
-            stateService.setUserState(from, 'IDLE');
-            await this.sendWelcomeMenu(from);
-            return;
+            return this.handleDocumentRouting(from, { documentType: 'STATEMENT', monthYear }, state.data.filePath, 'text');
         }
 
-        // --- Handle Statement File Upload (If month was provided first) ---
+        // --- Handle Statement File Upload ---
         if (state.state === 'AWAITING_STATEMENT_FILE' && (type === 'image' || type === 'document')) {
-            // This is handled by handleDocumentRouting
             return;
         }
 
@@ -334,46 +323,21 @@ class WhatsAppController {
             state.data.invoiceData.client_id = clientId;
             state.data.invoiceData.client_name = clientName;
 
-            if (state.data.invoiceData.payment_method && state.data.invoiceData.payment_method !== 'WhatsApp') {
-                stateService.setUserState(from, 'AWAITING_INVOICE_CONFIRMATION', state.data);
-                await this.sendInvoiceReviewButtons(from, state.data.invoiceData, state.data.filePath);
-            } else {
-                stateService.setUserState(from, 'AWAITING_INVOICE_PAYMENT_METHOD', state.data);
-                await this.sendPaymentMethodSelectionList(from);
-            }
-            return;
+            return this.handleDocumentRouting(from, state.data.invoiceData, state.data.filePath, 'interactive');
         }
 
-        // --- Handle Invoice Date Selection ---
-        if (state.state === 'AWAITING_INVOICE_DATE') {
-            state.data.invoiceData.date = text.trim();
-            
-            const clients = await laravelService.getClients(from);
-            if (clients && clients.length > 0) {
-                stateService.setUserState(from, 'AWAITING_INVOICE_CLIENT', state.data);
-                await this.sendClientSelectionList(from, clients);
-            } else {
-                stateService.setUserState(from, 'AWAITING_NEW_CLIENT_NAME', state.data);
-                await whatsappService.sendTextMessage(from, "No existing clients found. Please type the **Name of the Client** for this invoice:");
-            }
-            return;
-        }
+        // Redundant AWAITING_INVOICE_DATE handler removed - now handled by central logic above
         
         // --- Handle New Client Name Entry ---
         if (state.state === 'AWAITING_NEW_CLIENT_NAME') {
             state.data.invoiceData.client_name = text.trim();
-            stateService.setUserState(from, 'AWAITING_INVOICE_PAYMENT_METHOD', state.data);
-            await this.sendPaymentMethodSelectionList(from);
-            return;
+            return this.handleDocumentRouting(from, state.data.invoiceData, state.data.filePath, 'text');
         }
 
         // --- Handle Invoice Payment Method Selection ---
         if (state.state === 'AWAITING_INVOICE_PAYMENT_METHOD') {
             state.data.invoiceData.payment_method = interactiveId || text;
-
-            stateService.setUserState(from, 'AWAITING_INVOICE_CONFIRMATION', state.data);
-            await this.sendInvoiceReviewButtons(from, state.data.invoiceData, state.data.filePath);
-            return;
+            return this.handleDocumentRouting(from, state.data.invoiceData, state.data.filePath, 'interactive');
         }
 
         // --- Handle Expense Payment Method Selection ---
@@ -399,8 +363,10 @@ class WhatsAppController {
             return this.handleDocumentRouting(from, state.data.expenseData, state.data.receiptPath, 'interactive');
         }
 
-        // 1. Text & Unified Document Parsing
-        const isCommand = textLower.startsWith('expense') || 
+        // 1. Text Unified Parsing
+        const initialStates = ['AWAITING_EXPENSE_DATA', 'AWAITING_INVOICE_DATA', 'AWAITING_STATEMENT_DATA'];
+        const isCommand = initialStates.includes(state.state) || 
+                          textLower.startsWith('expense') || 
                           textLower.startsWith('invoice') || 
                           textLower.startsWith('statement') || 
                           text.split(' ').length > 2;
@@ -425,8 +391,21 @@ class WhatsAppController {
       if (type === 'image' || type === 'document' || type === 'audio') {
             const isCapturing = state.state !== 'IDLE';
 
+            // --- SMART AI TRIGGER ---
+            const initialStates = ['AWAITING_EXPENSE_DATA', 'AWAITING_INVOICE_DATA', 'AWAITING_STATEMENT_DATA'];
+            const needsAI = (type === 'audio') || 
+                            !isCapturing || 
+                            initialStates.includes(state.state) || 
+                            state.state.includes('EDIT') || 
+                            state.state.includes('ENTITY') || 
+                            state.state.includes('CATEGORY') ||
+                            state.state.includes('AMOUNT') ||
+                            state.state.includes('DATE');
+
             if (!isCapturing) {
                 await whatsappService.sendTextMessage(from, `Analyzing ${type} attachment...`);
+            } else if (needsAI) {
+                await whatsappService.sendTextMessage(from, `Processing ${type} to complete your record...`);
             } else {
                 await whatsappService.sendTextMessage(from, `Linking ${type} to current record...`);
             }
@@ -435,15 +414,10 @@ class WhatsAppController {
             const extension = type === 'image' ? 'jpg' : (type === 'audio' ? 'ogg' : (message.document.filename?.split('.').pop() || 'pdf'));
             const localPath = await storageService.downloadMedia(mediaId, `${type}_${Date.now()}.${extension}`);
             
-            // --- Size Validation ---
             const stats = fs.statSync(localPath);
             const fileSizeInMegabytes = stats.size / (1024 * 1024);
             if (fileSizeInMegabytes > 2.0) {
-                await whatsappService.sendTextMessage(from, 
-                    `File exceeds the 2MB size limit. Current size: ${fileSizeInMegabytes.toFixed(2)}MB.\n\n` +
-                    "Please provide a smaller file or a relevant photo to ensure synchronization."
-                );
-                // Clean up
+                await whatsappService.sendTextMessage(from, `File exceeds 2MB limit.`);
                 if (fs.existsSync(localPath)) fs.unlinkSync(localPath);
                 return;
             }
@@ -451,52 +425,35 @@ class WhatsAppController {
             let data = {};
             const categories = await laravelService.getCategories();
 
-            if (!isCapturing) {
+            if (needsAI) {
                 try {
                     if (type === 'audio') {
                         const transcription = await aiService.transcribeVoice(localPath, from);
-                        const transLower = transcription.toLowerCase();
-                        
-                        // Check if transcription is a request for Account Status
-                        if (transLower.includes('status') || transLower.includes('dashboard') || transLower.includes('report')) {
-                            await whatsappService.sendTextMessage(from, "Retrieving your account status summary from voice command...");
-                            const stats = await laravelService.getAccountStatus(from);
-                            await this.sendStatusInteractive(from, stats);
-                            return;
-                        }
-
                         data = await aiService.parseExpenseText(transcription, categories, from);
                     } else if (type === 'image') {
                         data = await aiService.parseReceiptImage(localPath, categories, from);
                     } else {
-                        // Documents (PDF)
                         let documentType = extension === 'pdf' ? 'STATEMENT' : 'EXPENSE';
-                        if (interactiveId === 'inv') documentType = 'INVOICE';
-                        else if (interactiveId === 'stmt') documentType = 'STATEMENT';
-                        
-                        data = { documentType, description: `Document: ${message.document?.filename || 'PDF Attachment'}` };
+                        if (state.state.includes('INVOICE')) documentType = 'INVOICE';
+                        data = { documentType, description: `Document: ${message.document?.filename || 'PDF'}` };
                     }
                 } catch (error) {
-                    if (error.message.includes("quota") || error.message.includes("limit")) {
-                        await whatsappService.sendTextMessage(from, `🛑 *AI Limit Reached*\n\n${error.message}`);
-                        if (fs.existsSync(localPath)) fs.unlinkSync(localPath);
+                    if (error.message.includes("quota")) {
+                        await whatsappService.sendTextMessage(from, `🛑 *AI Limit Reached*`);
                         return;
-                    } else {
-                        throw error;
                     }
+                    throw error;
                 }
             } else {
-                // If already capturing, we infer the documentType from the state and skip AI
                 if (state.state.includes('EXPENSE')) data.documentType = 'EXPENSE';
                 else if (state.state.includes('INVOICE')) data.documentType = 'INVOICE';
                 else if (state.state.includes('STATEMENT')) data.documentType = 'STATEMENT';
-                
                 data.description = `Linked ${type.toUpperCase()} Attachment`;
             }
 
             await this.handleDocumentRouting(from, data, localPath, type);
             return;
-        }
+      }
 
       // Fallback Menu
       if (type !== 'status' && !interactiveId) {
@@ -520,11 +477,6 @@ class WhatsAppController {
     // Smart Merge: Don't let empty data from linked attachments overwrite existing session data
     const isCapturing = currentState && currentState.state !== 'IDLE';
   
-    // AI uses 'entity' but invoices use 'client_name' - unify for routing logic
-    if (mergedData.documentType === 'INVOICE' && mergedData.entity && mergedData.entity !== 'General' && !mergedData.client_name) {
-        mergedData.client_name = mergedData.entity;
-    }
- 
     if (isCapturing) {
         const existingData = currentState.data.expenseData || currentState.data.invoiceData || {};
         if (!mergedData.amount && existingData.amount) mergedData.amount = existingData.amount;
@@ -547,6 +499,33 @@ class WhatsAppController {
         } else if (currentState.state.includes('STATEMENT')) {
             mergedData.documentType = 'STATEMENT';
             if (currentState.data.monthYear) mergedData.monthYear = currentState.data.monthYear;
+        }
+    }
+
+    // --- RE-REFINED SEQUENCING: Map and Resolve AFTER Merge ---
+    
+    // AI uses 'entity' but invoices use 'client_name' - unify for routing logic
+    if (mergedData.documentType === 'INVOICE' && mergedData.entity && mergedData.entity !== 'General' && !mergedData.client_name) {
+        mergedData.client_name = mergedData.entity;
+    }
+
+    // --- Automated Name Resolution ---
+    if (mergedData.client_name && !mergedData.client_id && mergedData.documentType === 'INVOICE') {
+        const clients = await laravelService.getClients(from);
+        const match = clients.find(c => 
+            (c.company_name && c.company_name.toLowerCase() === mergedData.client_name.toLowerCase()) ||
+            (c.client_name && c.client_name.toLowerCase() === mergedData.client_name.toLowerCase())
+        );
+        if (match) {
+            mergedData.client_id = match.id;
+            mergedData.client_name = match.company_name || match.client_name;
+        }
+    } else if (mergedData.entity && mergedData.entity !== 'General' && !mergedData.supplier_id && mergedData.documentType === 'EXPENSE') {
+        const suppliers = await laravelService.getSuppliers(from);
+        const match = suppliers.find(s => s.name && s.name.toLowerCase() === mergedData.entity.toLowerCase());
+        if (match) {
+            mergedData.supplier_id = match.id;
+            mergedData.entity = match.name;
         }
     }
 
@@ -711,8 +690,13 @@ class WhatsAppController {
     if (receiptPath) {
       const fileName = path.basename(receiptPath);
       const isAudio = fileName.endsWith('.ogg');
-      const previewUrl = `${config.botPublicUrl}/storage/${fileName}`;
-      body += `${isAudio ? 'Voice Note' : 'Receipt Image'}: Attached\nPreview: ${previewUrl}\n\nPlease confirm to save this entry.`;
+      
+      if (!isAudio) {
+        const previewUrl = `${config.botPublicUrl}/storage/${fileName}`;
+        body += `Receipt Image: Attached\nPreview: ${previewUrl}\n\nPlease confirm to save this entry.`;
+      } else {
+        body += `Please confirm the details extracted from your voice note to save this entry.`;
+      }
     } else {
       body += `You may upload a photo of the receipt now to link it, or confirm to save as text-only.`;
     }
@@ -736,8 +720,13 @@ class WhatsAppController {
     if (filePath) {
       const fileName = path.basename(filePath);
       const isAudio = fileName.endsWith('.ogg');
-      const previewUrl = `${config.botPublicUrl}/storage/${fileName}`;
-      body += `${isAudio ? 'Voice Note' : 'Invoice Document'}: Attached\nPreview: ${previewUrl}\n\nPlease confirm to save this entry.`;
+      
+      if (!isAudio) {
+        const previewUrl = `${config.botPublicUrl}/storage/${fileName}`;
+        body += `Invoice Document: Attached\nPreview: ${previewUrl}\n\nPlease confirm to save this entry.`;
+      } else {
+        body += `Please confirm the details extracted from your voice note to save this entry.`;
+      }
     } else {
       body += `You may upload the invoice document (PDF/Image) now to link it, or confirm to save as text-only.`;
     }
@@ -755,9 +744,12 @@ class WhatsAppController {
       { id: 'amt', title: 'Amount' },
       { id: 'date', title: 'Date' },
       { id: 'ent', title: type === 'INVOICE' ? 'Client' : 'Entity' },
-      { id: 'cat', title: 'Category' },
       { id: 'pay', title: 'Payment Via' }
     ];
+
+    if (type !== 'INVOICE') {
+      rows.splice(3, 0, { id: 'cat', title: 'Category' });
+    }
 
     rows.push({ id: 'desc', title: type === 'INVOICE' ? 'Notes' : 'Description' });
     rows.push({ id: 'all', title: 'Re-submit Entry' });
@@ -781,9 +773,9 @@ class WhatsAppController {
 
   async sendClientSelectionList(from, clients) {
     const body = `Please select the Client for this invoice:`;
-    const rows = clients.slice(0, 10).map(client => ({
+    const rows = clients.slice(0, 9).map(client => ({
         id: `${client.id}`,
-        title: client.company_name || client.client_name,
+        title: (client.company_name || client.client_name).substring(0, 24),
         description: `Customer ID: ${client.id}`
     }));
 
@@ -795,9 +787,9 @@ class WhatsAppController {
 
   async sendCategorySelectionList(from, categories) {
     const body = `Please select the Category for this expense:`;
-    const rows = categories.map(cat => ({
-        id: cat.name || cat,
-        title: cat.name || cat
+    const rows = categories.slice(0, 10).map(cat => ({
+        id: (cat.name || cat).substring(0, 200),
+        title: (cat.name || cat).substring(0, 24)
     }));
 
     const sections = [{ title: "Available Categories", rows }];
@@ -806,9 +798,9 @@ class WhatsAppController {
 
   async sendSupplierSelectionList(from, suppliers) {
     const body = `Please select the Supplier/Entity for this expense:`;
-    const rows = suppliers.slice(0, 10).map(s => ({
+    const rows = suppliers.slice(0, 9).map(s => ({
         id: s.name,
-        title: s.name,
+        title: s.name.substring(0, 24),
         description: `ID: ${s.id}`
     }));
     
