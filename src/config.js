@@ -15,5 +15,6 @@ module.exports = {
   },
   botPublicUrl: process.env.BOT_PUBLIC_URL || 'https://loura-dismal-electrovalently.ngrok-free.dev',
   botSecret: process.env.WHATSAPP_BOT_SECRET,
+  bypassAuth: process.env.BOT_AUTH_BYPASS === 'true',
   storageDir: process.env.STORAGE_DIR || '/tmp/whatsapp-bot-storage'
 };

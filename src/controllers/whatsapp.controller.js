@@ -32,6 +32,7 @@ class WhatsAppController {
   async handleWebhookEvent(req, res) {
     const body = req.body;
     console.log('📬 NEW WEBHOOK EVENT RECEIVED');
+    console.log('📦 BODY:', JSON.stringify(body, null, 2));
 
     if (body.object === 'whatsapp_business_account' && body.entry) {
       // 1. Respond 200 OK immediately to stop Meta from retrying
@@ -68,8 +69,14 @@ class WhatsAppController {
       console.log(`🔍 [DEBUG] Incoming message from: "${from}"`);
 
       // 0. Global Activation Check
-      const isAuth = await laravelService.checkAuth(from);
-      console.log(`🔍 [DEBUG] Auth check result for ${from}: ${isAuth}`);
+      let isAuth = config.bypassAuth === true;
+      
+      if (!isAuth) {
+        isAuth = await laravelService.checkAuth(from);
+        console.log(`🔍 [DEBUG] Auth check result for ${from}: ${isAuth}`);
+      } else {
+        console.log(`📡 [BYPASS] Activation check bypassed for ${from}`);
+      }
 
       if (!isAuth) {
           // If not auth, we only allow getting the welcome message which explains how to activate
