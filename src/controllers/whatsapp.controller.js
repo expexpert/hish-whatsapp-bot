@@ -871,19 +871,21 @@ class WhatsAppController {
     
     if (stats.invoicesCount > 0 && stats.pendingReviewCount > 0) {
       statusIcon = '🟡';
-      statusText = 'Pending Review';
+      statusText = 'Pending Review (Check portal)';
     } else if (stats.monthStatus === 'MISSING_DOCUMENTS') {
       statusIcon = '🟠';
-      statusText = 'Missing Documents';
+      statusText = 'Missing Documents (Action Required)';
     } else if (stats.invoicesCount === 0) {
       statusIcon = '⚪';
-      statusText = 'No activity recorded';
+      statusText = 'No activity recorded yet';
     }
 
     const missing = [];
     if (!stats.statementsCount) missing.push('Bank Statement');
     if (stats.invoicesCount === 0) missing.push('Invoices');
-    const missingText = missing.length > 0 ? `⚠️ *Missing:* ${missing.join(', ')}` : '✅ *All catch up documents received.*';
+    const missingText = missing.length > 0 
+        ? `⚠️ *Missing:* ${missing.join(', ')}\n_(Please upload these to the portal or send them here)_` 
+        : '✅ *All required documents received for this month.*';
 
     // Currency formatting (basic placeholder for now, could be dynamic)
     const fmt = (num) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'EUR' }).format(num);
