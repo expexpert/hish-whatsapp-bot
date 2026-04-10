@@ -11,13 +11,13 @@ class AIService {
   /**
    * Main parsing gateway: Real OpenAI vs. Regex Fallback
    */
-  async parseExpenseText(text, categories = [], phone = null) {
+  async parseExpenseText(text, categories = [], phone = null, skipCooldown = false) {
     if (this.openai && phone) {
-      const status = await laravelService.checkAiStatus(phone);
+      const status = await laravelService.checkAiStatus(phone, skipCooldown);
       if (!status.allowed) {
         throw new Error(status.message || "AI quota exceeded.");
       }
-      return this.parseWithOpenAI(text, categories, phone);
+      return this.parseWithOpenAI(text, categories, phone, skipCooldown);
     }
     return this.parseWithRegex(text);
   }
@@ -25,7 +25,7 @@ class AIService {
   /**
    * ADVANCED: NLP using GPT-4o-mini (highly efficient)
    */
-  async parseWithOpenAI(text, categories = [], phone = null) {
+  async parseWithOpenAI(text, categories = [], phone = null, skipCooldown = false) {
     console.log('Using OpenAI for NLP extraction...');
     const today = new Date().toISOString().split('T')[0];
     const catList = categories.length > 0 ? `Available Categories: [${categories.join(', ')}]. ` : '';
@@ -39,9 +39,11 @@ class AIService {
             role: "system", 
             content: `You are an accounting assistant. Today's Date is ${today}. Extract details from the user's message. ` + 
                       catList +
-                      "Try to match with 'Available Categories'. If no match, suggest a simple/logical new category (e.g., Food, Travel, Supplies). Do NOT use 'General' if a better inference exists. " +
+                      "Try to match with 'Available Categories'. If no match, suggest a simple/logical new category. Do NOT use 'General' if a better inference exists. " +
                       "Classify as 'EXPENSE' (receipt), 'STATEMENT' (bank summary), or 'INVOICE' (sales/income). " + 
-                      "Extract the Supplier (for expenses) or Client (for invoices) name into 'entity'. This is CRITICAL: If you see a company name like 'ABC Consulting', 'Google', or any entity mentioned as the recipient/source, put it in 'entity'. " + 
+                      "Extract the Supplier (for expenses) or Client (for invoices) name into 'entity'. " +
+                      "IMPORTANT: If the message starts with a command verb like 'Bill', 'Invoice', or 'Record' (e.g., 'Bill 100 to...'), do NOT take the word 'Bill' or 'Invoice' as the client name. " +
+                      "CRITICAL: If you are unsure of the entity name or it is a command, return 'Unknown' for 'entity'. " + 
                       "Output JSON only: { documentType, amount, vat, currency, category, entity, description, monthYear (for statements, MM-YYYY format), payment_method, date (YYYY-MM-DD) }." 
           },
           { role: "user", content: text }
@@ -51,7 +53,7 @@ class AIService {
 
       // Log usage if phone is provided
       if (phone && response.usage) {
-        await laravelService.logAiUsage(phone, model, response.usage.prompt_tokens, response.usage.completion_tokens);
+        await laravelService.logAiUsage(phone, model, response.usage.prompt_tokens, response.usage.completion_tokens, skipCooldown);
       }
 
       return JSON.parse(response.choices[0].message.content);
@@ -156,13 +158,13 @@ class AIService {
   /**
    * VOICE TRANSCRIPTION: Real Whisper vs. Mock Fallback
    */
-  async transcribeVoice(localFilePath, phone = null) {
+  async transcribeVoice(localFilePath, phone = null, skipCooldown = false) {
     if (this.openai && phone) {
-      const status = await laravelService.checkAiStatus(phone);
+      const status = await laravelService.checkAiStatus(phone, skipCooldown);
       if (!status.allowed) {
         throw new Error(status.message || "AI quota exceeded.");
       }
-      return this.transcribeWithWhisper(localFilePath, phone);
+      return this.transcribeWithWhisper(localFilePath, phone, skipCooldown);
     }
     return this.mockTranscription(localFilePath);
   }
@@ -170,7 +172,7 @@ class AIService {
   /**
    * ADVANCED: OpenAI Whisper
    */
-  async transcribeWithWhisper(localFilePath, phone = null) {
+  async transcribeWithWhisper(localFilePath, phone = null, skipCooldown = false) {
     console.log('Using OpenAI Whisper for Transcription...');
     try {
       const transcription = await this.openai.audio.transcriptions.create({
@@ -183,7 +185,7 @@ class AIService {
       if (phone) {
           // Whisper cost is per second. We'll log it as a fixed amount or 1 token for now in this version
           // for simplicity in the unified logging table.
-          await laravelService.logAiUsage(phone, "whisper-1", 0, 0); 
+          await laravelService.logAiUsage(phone, "whisper-1", 0, 0, skipCooldown); 
       }
 
       return transcription.text;
@@ -236,10 +238,16 @@ class AIService {
             content: [
               { 
                 type: "text", 
-                text: `You are an accounting assistant. Today's Date is ${today}. Analyze this document. Classify as 'EXPENSE' (receipt), 'STATEMENT' (bank summary), or 'INVOICE' (sales/income). ` + 
-                      catList +
-                      "Try to match with 'Available Categories'. If no match, suggest a logical new category (e.g., Food, Travel). Avoid 'General' if easier to infer. " +
-                      "Output JSON only: { documentType, amount, vat, currency, category, entity, description, monthYear (for statements, MM-YYYY format), invoiceNumber (for invoices), payment_method, date (YYYY-MM-DD) }." 
+                text: `You are an accounting assistant. Today's Date is ${today}. Analyze this document. 
+                Classify as:
+                - 'EXPENSE': Any receipt, bill, or proof of payment for goods/services.
+                - 'INVOICE': A sales invoice or request for payment sent to a customer.
+                - 'STATEMENT': ONLY if it is a official Bank Statement, Credit Card Summary, or Transaction List from a financial institution.
+                - 'UNKNOWN': If it is not a clear accounting document (e.g., a random photo, person, or generic text).
+
+                If 'STATEMENT', extract 'monthYear' in 'MM-YYYY' format based on the period covered.
+                
+                Return JSON: { "documentType": "EXPENSE"|"INVOICE"|"STATEMENT"|"UNKNOWN", "amount": 0.00, "currency": "USD", "date": "YYYY-MM-DD", "entity": "Supplier/Client Name", "notes": "Brief description", "monthYear": "MM-YYYY" }`
               },
               {
                 type: "image_url",
@@ -289,6 +297,99 @@ class AIService {
       category: "General",
       description: "Document received (Pending analysis)"
     };
+  }
+
+  /**
+   * INTENT CLASSIVER: Determines what the user wants to do from natural language
+   */
+  async classifyIntent(text, phone = null, skipCooldown = false) {
+      if (!this.openai || !text) return 'UNKNOWN';
+      
+      try {
+          // 1. Quota Check (Standard for all AI entry points)
+          if (phone) {
+              const status = await laravelService.checkAiStatus(phone, skipCooldown);
+              if (!status.allowed) return 'UNKNOWN'; // Silent fail for intent sensing to prevent blocking flow
+          }
+
+          const response = await this.openai.chat.completions.create({
+              model: "gpt-4o-mini",
+              messages: [
+                  { 
+                      role: "system", 
+                      content: "Classify the user's intent into exactly ONE of these tokens: " +
+                                "STATUS (wants reports, dashboard, balance, stats), " + 
+                                "EXPENSE (noun: purchase, receipt, cost. e.g. 'Phone bill', 'Amazon bill'), " +
+                                "INVOICE (verb/command: record a sale, bill a client, charging money. e.g. 'Bill for 100', 'Invoice ABC Corp'), " +
+                                "STATEMENT (wants to upload bank statements), " +
+                                "ACCOUNTANT (wants to ask a question to their accountant), " +
+                                "MENU (wants to start over, welcome message, cancel current task), " +
+                                "UNKNOWN (none of the above). " +
+                                "Context Clue: If the user says 'Bill [Amount]' as a command, it is an INVOICE. If they name a service like 'Electricity Bill', it is an EXPENSE. " +
+                                "Output the token only."
+                  },
+                  { role: "user", content: text }
+              ],
+              max_tokens: 10
+          });
+
+          const intent = response.choices[0].message.content.trim().toUpperCase();
+          console.log(`🤖 AI INTENT SENSING: "${text}" -> ${intent}`);
+
+          // Log usage
+          if (phone) {
+              await laravelService.logAiUsage(phone, "gpt-4o-mini", response.usage.prompt_tokens, response.usage.completion_tokens, skipCooldown);
+          }
+
+          const validIntents = ['STATUS', 'EXPENSE', 'INVOICE', 'STATEMENT', 'ACCOUNTANT', 'MENU'];
+          return validIntents.includes(intent) ? intent : 'UNKNOWN';
+      } catch (error) {
+          console.error('AI Intent Classification Error:', error.message);
+          return 'UNKNOWN';
+      }
+  }
+  /**
+   * STATEMENT MONTH PARSER: Converts natural language to standardized "Month YYYY"
+   */
+  async parseStatementMonth(text, phone = null, skipCooldown = false) {
+    if (!this.openai || !text) return 'Unknown';
+    const today = new Date().toISOString().split('T')[0];
+    
+    try {
+        if (phone) {
+            const status = await laravelService.checkAiStatus(phone, skipCooldown);
+            if (!status.allowed) return 'Unknown';
+        }
+
+        const response = await this.openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+                { 
+                    role: "system", 
+                    content: `You are an accounting assistant. Today is ${today}. ` + 
+                             "Extract the financial statement period (Month and Year) from the user's message. " +
+                             "Standardize to 'Month YYYY' (e.g., 'March 2026'). " +
+                             "If the user says 'Last month', calculate it accurately based on today's date. " +
+                             "If the user says 'Next week', 'Tomorrow', or anything that isn't a month, return 'Unknown'. " +
+                             "Output exactly the standardized string (e.g. 'April 2026') or 'Unknown' and nothing else." 
+                },
+                { role: "user", content: text }
+            ],
+            max_tokens: 20
+        });
+
+        const result = response.choices[0].message.content.trim();
+        
+        // Log usage
+        if (phone && response.usage) {
+            await laravelService.logAiUsage(phone, "gpt-4o-mini", response.usage.prompt_tokens, response.usage.completion_tokens, skipCooldown);
+        }
+
+        return result;
+    } catch (error) {
+        console.error('Statement Parsing Error:', error.message);
+        return 'Unknown';
+    }
   }
 }
 

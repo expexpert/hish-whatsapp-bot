@@ -7,6 +7,13 @@ const config = require('../config');
 const verifyMetaSignature = (req, res, next) => {
   const signature = req.headers['x-hub-signature-256'];
   const appSecret = config.whatsapp.appSecret;
+  
+  // NEW: Allow explicit bypass via config (for dev/debugging)
+  if (config.whatsapp.skipSignatureAuth === 'true' || config.whatsapp.skipSignatureAuth === true) {
+      console.warn('⚡ BYPASS: Skipping Meta signature verification (SKIP_SIGNATURE_AUTH enabled)');
+      return next();
+  }
+
   if (!signature || !appSecret) {
     // For demo skip if no app secret set
     if (!appSecret) {

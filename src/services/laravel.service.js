@@ -7,14 +7,22 @@ class LaravelService {
     this.botSecret = process.env.WHATSAPP_BOT_SECRET ;
   }
 
-  getBotHeaders(phone = null) {
+  getBotHeaders(phone = null, skipCooldown = false) {
     const headers = {
       'X-Bot-Secret': this.botSecret,
-      'Accept': 'application/json',
+      'X-Customer-Phone': phone,
+      'Accept': 'application/json'
     };
-    if (phone) {
-      headers['X-Customer-Phone'] = phone;
+
+    if (skipCooldown) {
+      headers['X-AI-Skip-Cooldown'] = 'true';
     }
+    
+    // Global AI Limits Bypass (Controlled via Header)
+    if (process.env.SKIP_AI_LIMITS === 'true') {
+      headers['X-AI-Skip-Limits'] = 'true';
+    }
+
     return headers;
   }
 
@@ -43,8 +51,12 @@ class LaravelService {
     
     try {
       const now = new Date();
-      const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split('T')[0];
-      const endOfMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().split('T')[0];
+      const year = now.getFullYear();
+      const month = String(now.getMonth() + 1).padStart(2, '0');
+      const startOfMonth = `${year}-${month}-01`;
+      
+      const lastDay = new Date(year, now.getMonth() + 1, 0).getDate();
+      const endOfMonth = `${year}-${month}-${String(lastDay).padStart(2, '0')}`;
 
       const response = await axios.get(`${this.baseUrl}/customer/dashboard-data`, {
         headers: this.getBotHeaders(phone),
@@ -103,7 +115,14 @@ class LaravelService {
       form.append('date', data.date || new Date().toISOString().split('T')[0]);
 
       if (filePath && fs.existsSync(filePath)) {
-        form.append('file', fs.createReadStream(filePath));
+        const ext = filePath.toLowerCase();
+        const isSupported = ext.endsWith('.jpg') || ext.endsWith('.jpeg') || ext.endsWith('.png') || ext.endsWith('.pdf');
+        
+        if (isSupported) {
+          form.append('file', fs.createReadStream(filePath));
+        } else {
+          console.log(`📎 [INFO] Skipping non-image attachment for Laravel API: ${filePath}`);
+        }
       }
 
       const response = await axios.post(`${this.baseUrl}/customer/customer-expense`, form, {
@@ -180,7 +199,14 @@ class LaravelService {
           form.append('articles[0][tva_percentage]', data.vat || 0);
 
           if (filePath && fs.existsSync(filePath)) {
-              form.append('document', fs.createReadStream(filePath));
+              const ext = filePath.toLowerCase();
+              const isSupported = ext.endsWith('.jpg') || ext.endsWith('.jpeg') || ext.endsWith('.png') || ext.endsWith('.pdf');
+              
+              if (isSupported) {
+                  form.append('document', fs.createReadStream(filePath));
+              } else {
+                  console.log(`📎 [INFO] Skipping non-image/PDF invoice attachment for Laravel API: ${filePath}`);
+              }
           }
 
           const response = await axios.post(`${this.baseUrl}/customer/customer-invoice`, form, {
@@ -247,10 +273,10 @@ class LaravelService {
   /**
    * Check if a user is allowed to use AI (Quota Check)
    */
-  async checkAiStatus(phone) {
+  async checkAiStatus(phone, skipCooldown = false) {
     try {
       const response = await axios.get(`${this.baseUrl}/customer/ai/status`, {
-        headers: this.getBotHeaders(phone)
+        headers: this.getBotHeaders(phone, skipCooldown)
       });
       return response.data; // { allowed: boolean, reason?: string, message?: string }
     } catch (error) {
@@ -262,14 +288,14 @@ class LaravelService {
   /**
    * Log AI token usage after successful call
    */
-  async logAiUsage(phone, model, tokensIn, tokensOut) {
+  async logAiUsage(phone, model, tokensIn, tokensOut, skipCooldown = false) {
     try {
       await axios.post(`${this.baseUrl}/customer/ai/log`, {
         model,
         tokens_in: tokensIn,
         tokens_out: tokensOut
       }, {
-        headers: this.getBotHeaders(phone)
+        headers: this.getBotHeaders(phone, skipCooldown)
       });
     } catch (error) {
       console.error('Laravel AI Log Error:', error.message);
