@@ -76,7 +76,7 @@ class LaravelService {
         expensesCount: data.total_expenses_count || 0,
         pendingReviewCount: data.total_pending_review_count || 0,
         statementsCount: data.bank_statements_count || 0,
-        monthStatus: data.month_status || 'MISSING_DOCUMENTS',
+        monthStatus: data.month_status || null,
         salesSum: data.total_issued_sum || 0,
         expensesSum: data.total_expenses_sum || 0,
         vatPayable: data.total_vat_payable || 0,

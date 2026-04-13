@@ -866,18 +866,23 @@ class WhatsAppController {
     const balance = income - expenses;
     const vat = stats.vatPayable || 0;
     
-    let statusIcon = '🟢';
-    let statusText = 'Accounts Validated';
+    let statusIcon = '⚪';
+    let statusText = 'No activity recorded yet';
     
-    if (stats.invoicesCount > 0 && stats.pendingReviewCount > 0) {
-      statusIcon = '🟡';
-      statusText = 'Pending Review (Check portal)';
-    } else if (stats.monthStatus === 'MISSING_DOCUMENTS') {
-      statusIcon = '🟠';
-      statusText = 'Missing Documents (Action Required)';
-    } else if (stats.invoicesCount === 0) {
-      statusIcon = '⚪';
-      statusText = 'No activity recorded yet';
+    if (stats.invoicesCount > 0) {
+        if (stats.pendingReviewCount > 0) {
+            statusIcon = '🟡';
+            statusText = 'Pending Review (Check portal)';
+        } else if (stats.statementsCount > 0) {
+            statusIcon = '🟢';
+            statusText = 'Accounts Validated';
+        } else {
+            statusIcon = '🟠';
+            statusText = 'Missing Documents (Action Required)';
+        }
+    } else if (stats.statementsCount > 0) {
+        statusIcon = '🟠';
+        statusText = 'Invoices Missing (Action Required)';
     }
 
     const missing = [];
@@ -885,7 +890,11 @@ class WhatsAppController {
     if (stats.invoicesCount === 0) missing.push('Invoices');
     const missingText = missing.length > 0 
         ? `⚠️ *Missing:* ${missing.join(', ')}\n_(Please upload these to the portal or send them here)_` 
-        : '✅ *All required documents received for this month.*';
+        : (statusIcon === '🟢' 
+            ? '✅ *All required documents received for this month.*'
+            : (stats.monthStatus === 'MISSING_DOCUMENTS' 
+                ? `🟠 *Note:* Some transaction receipts or missing details still need your attention in the portal.`
+                : '✅ *All required documents received for this month.*'));
 
     // Currency formatting (basic placeholder for now, could be dynamic)
     const fmt = (num) => new Intl.NumberFormat('en-US', { style: 'currency', currency: 'EUR' }).format(num);

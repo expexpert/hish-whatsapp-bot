@@ -319,12 +319,13 @@ class AIService {
                       role: "system", 
                       content: "Classify the user's intent into exactly ONE of these tokens: " +
                                 "STATUS (wants reports, dashboard, balance, stats), " + 
-                                "EXPENSE (noun: purchase, receipt, cost. e.g. 'Phone bill', 'Amazon bill'), " +
-                                "INVOICE (verb/command: record a sale, bill a client, charging money. e.g. 'Bill for 100', 'Invoice ABC Corp'), " +
+                                "EXPENSE (OUTFLOW/SPENDING: paid someone, purchase, receipt, cost. e.g. 'Paid Google 500', 'Spent 10', 'Amazon receipt', 'Phone bill'), " +
+                                "INVOICE (INFLOW/INCOME: record a sale, bill a client, client paid you. e.g. 'Bill Client ABC 1000', 'Invoice for services', 'Sold product to X'), " +
                                 "STATEMENT (wants to upload bank statements), " +
                                 "ACCOUNTANT (wants to ask a question to their accountant), " +
                                 "MENU (wants to start over, welcome message, cancel current task), " +
                                 "UNKNOWN (none of the above). " +
+                                "CRITICAL LOGIC: 'Paid [Someone]' is always an EXPENSE. 'Billed [Someone]' or 'Invoice to [Someone]' is always an INVOICE. " +
                                 "Context Clue: If the user says 'Bill [Amount]' as a command, it is an INVOICE. If they name a service like 'Electricity Bill', it is an EXPENSE. " +
                                 "Output the token only."
                   },
