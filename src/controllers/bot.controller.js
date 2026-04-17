@@ -1,5 +1,5 @@
-const whatsappService = require('../services/whatsapp.service');
 const config = require('../config');
+const whatsappService = require('../services/whatsapp.service');
 
 class BotController {
   /**

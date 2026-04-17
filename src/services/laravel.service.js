@@ -46,41 +46,68 @@ class LaravelService {
   /**
    * Get dynamic dashboard stats for a specific phone number
    */
-  async getAccountStatus(phone) {
-    console.log(`📊 Fetching Dashboard Data for ${phone} (Hybrid Mode)...`);
+  async getAccountStatus(phone, targetMonth = null, targetYear = null, clientId = null, supplierId = null) {
+    const rawTargetMonth = targetMonth;
+    const rawTargetYear = targetYear;
     
     try {
       const now = new Date();
-      const year = now.getFullYear();
-      const month = String(now.getMonth() + 1).padStart(2, '0');
-      const startOfMonth = `${year}-${month}-01`;
+      const currentYear = rawTargetYear || now.getFullYear();
+      const currentMonthIdx = rawTargetMonth ? (parseInt(rawTargetMonth) - 1) : now.getMonth();
+      const monthNum = String(currentMonthIdx + 1).padStart(2, '0');
       
-      const lastDay = new Date(year, now.getMonth() + 1, 0).getDate();
-      const endOfMonth = `${year}-${month}-${String(lastDay).padStart(2, '0')}`;
+      const params = {};
+      
+      // Only apply date filters if a specific month/year is requested
+      if (rawTargetMonth || rawTargetYear) {
+          const startStr = `${currentYear}-${monthNum}-01`;
+          const lastDay = new Date(currentYear, currentMonthIdx + 1, 0).getDate();
+          const endStr = `${currentYear}-${monthNum}-${String(lastDay).padStart(2, '0')}`;
+          
+          params.date_from = startStr;
+          params.date_to = endStr;
+      }
+
+      if (clientId) params.client_id = clientId;
+      if (supplierId) params.supplier_id = supplierId;
 
       const response = await axios.get(`${this.baseUrl}/customer/dashboard-data`, {
-        headers: this.getBotHeaders(phone),
-        params: {
-          date_from: startOfMonth,
-          date_to: endOfMonth
-        }
+        params: params,
+        timeout: 15000, // 15 seconds safety cutoff
+        headers: this.getBotHeaders(phone)
       });
+
       const data = response.data.data;
       
-      // Standard API might have different keys than the old Bot controller
+      // Calculate display period string
+      let periodLabel = "All Time";
+      if (rawTargetMonth || rawTargetYear) {
+          const displayDate = new Date(currentYear, currentMonthIdx, 1);
+          periodLabel = displayDate.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+      }
+
       return {
-        month: new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' }),
+        month: periodLabel,
         status: data.is_enable_login ? 'Active' : 'Pending',
-        totalDocuments: (data.total_issued_count || 0) + (data.total_expenses_count || 0) + (data.bank_statements_count || 0),
-        invoicesCount: data.total_issued_count || 0,
-        expensesCount: data.total_expenses_count || 0,
-        pendingReviewCount: data.total_pending_review_count || 0,
-        statementsCount: data.bank_statements_count || 0,
-        monthStatus: data.month_status || null,
-        salesSum: data.total_issued_sum || 0,
-        expensesSum: data.total_expenses_sum || 0,
-        vatPayable: data.total_vat_payable || 0,
-        recentDocuments: [] // Standard dashboard doesn't return recent docs in same payload
+        totalDocuments: (parseInt(data.total_paid_count) || 0) + (parseInt(data.total_issued_count) || 0) + (parseInt(data.total_expenses_count) || 0),
+        invoicesCount: (parseInt(data.total_paid_count) || 0) + (parseInt(data.total_issued_count) || 0),
+        expensesCount: parseInt(data.total_expenses_count) || 0,
+        // Corrected Flat Mappings (Matches CustomerController.php json response)
+        salesSum: parseFloat(data.revenue) || 0,
+        cash_revenue_sum: parseFloat(data.revenue) || 0,
+        total_unpaid_sum: parseFloat(data.unpaidInvoiceSum) || 0,
+        total_quote_sum: parseFloat(data.total_quote_sum) || 0,
+        cash_vat_sum: parseFloat(data.total_vat_payable) || 0, // Aligning with standardized VAT
+        total_paid_sum: parseFloat(data.total_paid_sum) || 0,
+        
+        pendingReviewCount: parseInt(data.pendingReviewCount) || 0,
+        statementsCount: parseInt(data.statementsCount) || 0,
+        
+        expensesSum: parseFloat(data.expense) || 0,
+        total_expenses_sum: parseFloat(data.expense) || 0,
+        expenseVat: parseFloat(data.total_expenses_vat) || 0,
+        vatPayable: parseFloat(data.total_vat_payable) || 0,
+        recentDocuments: [] 
       };
     } catch (error) {
       console.error('Laravel Hybrid Status Error:', error.response?.data || error.message);
@@ -88,7 +115,14 @@ class LaravelService {
         month: new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' }),
         status: 'Error fetching data',
         documentsReceived: 0,
+        salesSum: 0,
+        cash_revenue_sum: 0,
+        total_unpaid_sum: 0,
+        total_quote_sum: 0,
+        cash_vat_sum: 0,
         expensesSum: 0,
+        total_expenses_sum: 0,
+        expenseVat: 0,
         vatPayable: 0,
         recentDocuments: []
       };
@@ -186,9 +220,15 @@ class LaravelService {
           form.append('amount', data.amount);
           form.append('notes', data.notes || data.description || '');
           form.append('payment_method', data.payment_method || 'WhatsApp');
-          form.append('date', data.date || new Date().toISOString().split('T')[0]);
+          const invoiceDateStr = data.date || new Date().toISOString().split('T')[0];
+          const invoiceDate = new Date(invoiceDateStr);
+          const dueDate = new Date(invoiceDate);
+          dueDate.setDate(dueDate.getDate() + 30);
+          
+          form.append('date', invoiceDateStr);
+          form.append('due_date', dueDate.toISOString().split('T')[0]);
           form.append('invoice_number', `INV-WA-${Date.now()}`); // Standard API requires unique invoice number
-          form.append('status', 'ISSUED');
+          form.append('status', data.status || 'ISSUED');
 
           // Add a default article so the invoice shows up in the dashboard sums
           const designation = data.notes || data.description || 'Professional Services';
@@ -228,7 +268,8 @@ class LaravelService {
   async getClients(phone) {
       console.log(`👥 Fetching Clients for ${phone}...`);
       try {
-      const response = await axios.get(`${this.baseUrl}/customer/customer-clients`, {
+      const response = await axios.get(`${this.baseUrl}/customer/customer-clients?sort=recent`, {
+        timeout: 15000,
         headers: this.getBotHeaders(phone)
       });
       return response.data.data || [];
@@ -260,7 +301,7 @@ class LaravelService {
   async getSuppliers(phone) {
       console.log(`🚚 Fetching Suppliers for ${phone}...`);
       try {
-      const response = await axios.get(`${this.baseUrl}/customer/transaction-resources`, {
+      const response = await axios.get(`${this.baseUrl}/customer/transaction-resources?sort=recent`, {
         headers: this.getBotHeaders(phone)
       });
       return response.data.data.suppliers || [];

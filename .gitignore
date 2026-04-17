@@ -1,3 +1,7 @@
 node_modules
 .env
 .wwebjs_auth
+# Bot State & Persistent Logs
+states.json
+*.log
+*.zip

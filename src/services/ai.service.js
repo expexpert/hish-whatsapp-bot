@@ -41,10 +41,15 @@ class AIService {
                       catList +
                       "Try to match with 'Available Categories'. If no match, suggest a simple/logical new category. Do NOT use 'General' if a better inference exists. " +
                       "Classify as 'EXPENSE' (receipt), 'STATEMENT' (bank summary), or 'INVOICE' (sales/income). " + 
+                      "Extract the status of the document into 'status'. For invoices: ['Paid', 'Unpaid', 'Draft']. For expenses: ['Paid', 'Pending']. If the user does NOT explicitly mention the status (like 'paid' or 'draft'), you MUST return null for 'status'. Do NOT guess. " +
                       "Extract the Supplier (for expenses) or Client (for invoices) name into 'entity'. " +
                       "IMPORTANT: If the message starts with a command verb like 'Bill', 'Invoice', or 'Record' (e.g., 'Bill 100 to...'), do NOT take the word 'Bill' or 'Invoice' as the client name. " +
                       "CRITICAL: If you are unsure of the entity name or it is a command, return 'Unknown' for 'entity'. " + 
-                      "Output JSON only: { documentType, amount, vat, currency, category, entity, description, monthYear (for statements, MM-YYYY format), payment_method, date (YYYY-MM-DD) }." 
+                      "PAYMENT METHODS: Strictly identify and map to one of: ['Cash', 'Bank Transfer', 'Credit/Debit Card', 'Cheque', 'Mobile Payment', 'Online Payment', 'Direct Debit', 'Deferred Payment', 'Instant Bank Transfer', 'PayPal', 'Other']. " +
+                      "IMPORTANT: If the payment method is NOT mentioned in the text or visible on the receipt, return `null` for 'payment_method'. Do NOT guess 'Other' or 'WhatsApp'. " +
+                      "IMPORTANT: For the 'date' field, only return a date if clearly mentioned or identifiable. If not found, return `null`. " +
+                      "IMPORTANT: Extract the currency accurately (e.g., 'MAD', 'EUR', 'USD'). If not mentioned, default to 'MAD'. " +
+                      "Output JSON only: { documentType, status, amount, vat, currency, category, entity, description, monthYear (for statements, MM-YYYY format), payment_method, date (YYYY-MM-DD) }." 
           },
           { role: "user", content: text }
         ],
@@ -82,22 +87,31 @@ class AIService {
     const amount = amountMatch ? parseFloat(amountMatch[1]) : 0;
     
     // Extract Currency
-    let currency = 'USD';
+    let currency = 'MAD';
     if (textLower.includes('eur') || textLower.includes('€')) currency = 'EUR';
+    else if (textLower.includes('usd') || textLower.includes('$')) currency = 'USD';
+    else if (textLower.includes('mad') || textLower.includes('dirham')) currency = 'MAD';
 
-    // Extract Date (Basic YYYY-MM-DD or DD/MM/YYYY)
-    let date = new Date().toISOString().split('T')[0];
+    // Extract Date
+    let date = null;
     const dateRegex = /(\d{4}-\d{2}-\d{2})|(\d{2}[/-]\d{2}[/-]\d{4})/;
     const dateMatch = text.match(dateRegex);
     if (dateMatch) date = dateMatch[0].replace(/\//g, '-');
 
     // Extract Payment Method
-    let payment_method = 'WhatsApp';
+    let payment_method = null;
     const payKeywords = {
-        'Cash': [/cash/i, /paid in cash/i],
-        'Bank Transfer': [/transfer/i, /bank/i, /wire/i, /eft/i],
-        'Credit Card': [/card/i, /visa/i, /mastercard/i, /amex/i],
-        'PayPal': [/paypal/i]
+        'Cash': [/cash/i, /paid in cash/i, /espèce/i],
+        'Bank Transfer': [/transfer/i, /bank/i, /wire/i, /virement/i, /eft/i],
+        'Credit/Debit Card': [/card/i, /visa/i, /mastercard/i, /amex/i, /carte/i, /cb/i],
+        'Cheque': [/cheque/i, /chèque/i],
+        'Mobile Payment': [/mobile/i, /phone/i, /m-pesa/i, /orange money/i, /momo/i],
+        'Online Payment': [/online/i, /web/i, /internet/i, /stripe/i],
+        'Direct Debit': [/direct debit/i, /prélèvement/i, /auto-pay/i],
+        'Deferred Payment': [/deferred/i, /later/i, /post-paid/i],
+        'Instant Bank Transfer': [/instant/i, /faster payment/i],
+        'PayPal': [/paypal/i],
+        'Other': [/other/i, /autre/i]
     };
     for (const [method, patterns] of Object.entries(payKeywords)) {
         if (patterns.some(p => p.test(textLower))) {
@@ -238,16 +252,18 @@ class AIService {
             content: [
               { 
                 type: "text", 
-                text: `You are an accounting assistant. Today's Date is ${today}. Analyze this document. 
+                text: `You are an accounting assistant specialized in Moroccan bookkeeping. Today's Date is ${today}. Analyze this document. 
                 Classify as:
                 - 'EXPENSE': Any receipt, bill, or proof of payment for goods/services.
                 - 'INVOICE': A sales invoice or request for payment sent to a customer.
                 - 'STATEMENT': ONLY if it is a official Bank Statement, Credit Card Summary, or Transaction List from a financial institution.
-                - 'UNKNOWN': If it is not a clear accounting document (e.g., a random photo, person, or generic text).
+                - 'UNKNOWN': If it is not a clear accounting document.
 
-                If 'STATEMENT', extract 'monthYear' in 'MM-YYYY' format based on the period covered.
+                IMPORTANT: If currency is not explicitly clear but context suggests Morocco, use "MAD".
                 
-                Return JSON: { "documentType": "EXPENSE"|"INVOICE"|"STATEMENT"|"UNKNOWN", "amount": 0.00, "currency": "USD", "date": "YYYY-MM-DD", "entity": "Supplier/Client Name", "notes": "Brief description", "monthYear": "MM-YYYY" }`
+                PAYMENT METHODS: Identify and map to: ['Cash', 'Bank Transfer', 'Credit/Debit Card', 'Cheque', 'Mobile Payment', 'Online Payment', 'Direct Debit', 'Deferred Payment', 'Instant Bank Transfer', 'PayPal', 'Other'].
+
+                Return JSON: { "documentType": "EXPENSE"|"INVOICE"|"STATEMENT"|"UNKNOWN", "amount": 0.00, "currency": "MAD", "date": "YYYY-MM-DD", "entity": "Supplier/Client Name", "notes": "Brief description", "monthYear": "MM-YYYY", "payment_method": "String" }`
               },
               {
                 type: "image_url",
@@ -271,7 +287,7 @@ class AIService {
         documentType: result.documentType || 'EXPENSE',
         amount: result.amount || 0,
         vat: result.vat || 0,
-        currency: result.currency || 'USD',
+        currency: result.currency || 'MAD',
         category: result.category || 'Accounting',
         entity: result.entity || 'General',
         description: result.description || 'Processed via AI',
@@ -318,15 +334,15 @@ class AIService {
                   { 
                       role: "system", 
                       content: "Classify the user's intent into exactly ONE of these tokens: " +
-                                "STATUS (wants reports, dashboard, balance, stats), " + 
+                                "STATUS (USER JUST WANTS THE LIVE DASHBOARD: looking for current balance, general status without specifying a month/year. e.g. 'Status', 'Balance', clicks 'Account Status' button), " + 
+                                "REPORT (USER WANTS FILTERED HISTORICAL DATA: asking for summaries of specific months, years, or entities. ANY mention of the word 'Report', 'Summary', or a month name like 'March', 'Jan', 'Last Month', or a year like '2025' MUST be classified as REPORT. e.g. 'Report for Amazon', 'March summary', 'Total for last year'), " +
                                 "EXPENSE (OUTFLOW/SPENDING: paid someone, purchase, receipt, cost. e.g. 'Paid Google 500', 'Spent 10', 'Amazon receipt', 'Phone bill'), " +
                                 "INVOICE (INFLOW/INCOME: record a sale, bill a client, client paid you. e.g. 'Bill Client ABC 1000', 'Invoice for services', 'Sold product to X'), " +
                                 "STATEMENT (wants to upload bank statements), " +
                                 "ACCOUNTANT (wants to ask a question to their accountant), " +
                                 "MENU (wants to start over, welcome message, cancel current task), " +
                                 "UNKNOWN (none of the above). " +
-                                "CRITICAL LOGIC: 'Paid [Someone]' is always an EXPENSE. 'Billed [Someone]' or 'Invoice to [Someone]' is always an INVOICE. " +
-                                "Context Clue: If the user says 'Bill [Amount]' as a command, it is an INVOICE. If they name a service like 'Electricity Bill', it is an EXPENSE. " +
+                                "CRITICAL LOGIC: Mentions of 'March', 'December', or any month name ALWAYS mean REPORT. 'Paid [Someone]' is always an EXPENSE. 'Billed [Someone]' or 'Invoice to [Someone]' is always an INVOICE. " +
                                 "Output the token only."
                   },
                   { role: "user", content: text }
@@ -342,7 +358,7 @@ class AIService {
               await laravelService.logAiUsage(phone, "gpt-4o-mini", response.usage.prompt_tokens, response.usage.completion_tokens, skipCooldown);
           }
 
-          const validIntents = ['STATUS', 'EXPENSE', 'INVOICE', 'STATEMENT', 'ACCOUNTANT', 'MENU'];
+          const validIntents = ['STATUS', 'EXPENSE', 'INVOICE', 'STATEMENT', 'ACCOUNTANT', 'MENU', 'REPORT'];
           return validIntents.includes(intent) ? intent : 'UNKNOWN';
       } catch (error) {
           console.error('AI Intent Classification Error:', error.message);
@@ -392,6 +408,90 @@ class AIService {
         return 'Unknown';
     }
   }
+
+  /**
+   * FIELD VALIDATOR: Checks if a piece of text is "meaningful" for a specific field.
+   * Prevents social chatter/noise from entering the database.
+   */
+  async validateFieldAI(text, type, phone = null, skipCooldown = false) {
+    if (!this.openai || !text) return false;
+    
+    // Quick logic first: If looking for amount and we see digits, it's probably valid.
+    if (type === 'AMOUNT' && /\d/.test(text)) return true;
+
+    try {
+        const prompts = {
+            'AMOUNT': "Is this text a price or numeric value (e.g. 'Fifty', '20.00', '10k')? Return 'YES' or 'NO'.",
+            'ENTITY': "Is this text a business name, brand, or person's name (e.g. 'Amazon', 'Mr. Smith', 'Taxi')? Return 'YES' or 'NO'. Note: If it's a social sentence like 'who are you', 'how are you', return 'NO'.",
+            'CATEGORY': "Is this a valid business category? Return 'YES' or 'NO'."
+        };
+
+        const response = await this.openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+                { 
+                    role: "system", 
+                    content: prompts[type] || "Check if this text is meaningful data for an accounting field. Return 'YES' or 'NO'." 
+                },
+                { role: "user", content: text }
+            ],
+            max_tokens: 5
+        });
+
+        const result = response.choices[0].message.content.trim().toUpperCase();
+        
+        // Log usage
+        if (phone && response.usage) {
+            await laravelService.logAiUsage(phone, "gpt-4o-mini", response.usage.prompt_tokens, response.usage.completion_tokens, skipCooldown);
+        }
+
+        return result === 'YES';
+    } catch (error) {
+        console.error('AI Field Validation Error:', error.message);
+        return true; // Fallback to allowing it if AI fails
+    }
+  }
+
+  /**
+     * Parse a natural language report query to extract filters
+     */
+    async parseReportQuery(text, from) {
+        console.log(`🤖 AI SENSING REPORT QUERY: "${text}"`);
+        try {
+            const prompt = `
+            You are a professional accounting assistant. Extract reporting filters from the user's message.
+            User Message: "${text}"
+            Current Date: ${new Date().toISOString().split('T')[0]}
+
+            RULES:
+            1. If they mention a month (e.g. "March", "last month"), extract the month number (1-12).
+            2. If they mention a year (e.g. "2025", "next year"), extract the year (YYYY).
+            3. If they mention a name of a person or company (e.g. "Amazon", "Client X"), extract it as 'entityName'.
+            4. If no specific name is mentioned, return null for 'entityName'.
+            5. Determine if they are asking for 'expenses', 'invoices' (sales/income), or a 'general' summary.
+
+            RETURN JSON ONLY:
+            {
+                "entityName": string | null,
+                "month": number | null,
+                "year": number | null,
+                "dataType": "expenses" | "invoices" | "general"
+            }
+            `;
+
+            const completion = await this.openai.chat.completions.create({
+                model: "gpt-4o-mini",
+                messages: [{ role: "user", content: prompt }],
+                response_format: { type: "json_object" }
+            });
+
+            const result = JSON.parse(completion.choices[0].message.content);
+            return result;
+        } catch (error) {
+            console.error('AI Report Query Parsing Error:', error);
+            return { entityName: null, month: null, year: null, dataType: "general" };
+        }
+    }
 }
 
 module.exports = new AIService();

@@ -153,6 +153,39 @@ class WhatsAppService {
       throw error;
     }
   }
+
+  /**
+   * Send a real file (PDF, Image) as a downloadable document
+   * @param {string} to - Recipient phone number
+   * @param {string} url - Publicly accessible URL of the file
+   * @param {string} filename - Display name for the file
+   */
+  async sendDocument(to, url, filename) {
+    const apiURL = `${this.baseUrl}/${this.phoneNumberId}/messages`;
+    const payload = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: to,
+      type: 'document',
+      document: {
+        link: url,
+        filename: filename
+      }
+    };
+
+    try {
+      const response = await axios.post(apiURL, payload, {
+        headers: {
+          'Authorization': `Bearer ${this.accessToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      return response.data;
+    } catch (error) {
+      console.error('WhatsApp Send Document Error:', error.response ? error.response.data : error.message);
+      throw error;
+    }
+  }
 }
 
 
