@@ -14,6 +14,19 @@ class WhatsAppController {
     // Periodically clear old IDs to prevent memory leak
     setInterval(() => this.processedMessageIds.clear(), 3600000); // Every hour
   }
+
+  // Persistent Debug Logger
+  logDebug(message, data = null) {
+      const timestamp = new Date().toISOString();
+      let logLine = `[${timestamp}] ${message}\n`;
+      if (data) logLine += `DATA: ${JSON.stringify(data, null, 2)}\n`;
+      logLine += `-------------------------------------------\n`;
+      try {
+          fs.appendFileSync(path.join(process.cwd(), 'debug_trace.log'), logLine);
+      } catch (err) {
+          console.error('Failed to write to debug_trace.log', err);
+      }
+  }
   
   async verifyWebhook(req, res) {
     const mode = req.query['hub.mode'];
@@ -236,6 +249,14 @@ class WhatsAppController {
              return;
         }
 
+        // --- NEW: Handle Dashboard PDF/Media Deliveries ---
+        if (interactiveId && (interactiveId.startsWith('v_inv_') || interactiveId.startsWith('v_exp_'))) {
+            const type = interactiveId.startsWith('v_inv_') ? 'inv' : 'exp';
+            const id = interactiveId.replace('v_inv_', '').replace('v_exp_', '');
+            await this.handleDeliverSpecificMedia(from, type, id);
+            return;
+        }
+
         // --- NEW: Handle Dynamic List Selections ---
         if (interactiveId && (interactiveId.startsWith('list_inv_') || interactiveId.startsWith('list_exp_'))) {
             const parts = interactiveId.split('_');
@@ -393,18 +414,25 @@ class WhatsAppController {
               
               if (!isAudio) {
                 feedback += "\nYour document has been synchronized with the portal.";
-                if (result.data && result.data.download_url) {
-                    feedback += `\n\n---
-📥 *OPEN RECEIPT*
-${result.data.download_url}`;
-                } else if (result.data && result.data.id) {
-                    const downloadUrl = `${laravelService.publicUrl}/api/bot/file/${result.data.id}`;
-                    feedback += `\n\n---
+                
+                // Use signed URL if available, else fallback safely
+                if (result.data && (result.data.download_url || result.data.id)) {
+                  const downloadUrl = result.data.download_url || `${laravelService.publicUrl}/api/bot/file/${result.data.id}`;
+                  
+                  if (downloadUrl.includes('localhost') || downloadUrl.includes('127.0.0.1')) {
+                    console.warn(`⚠️ [WARNING] Sending localhost URL to Meta (Expense): ${downloadUrl}`);
+                  }
+                  console.log(`💸 [INFO] Delivering Expense Receipt: ${downloadUrl}`);
+
+                  feedback += `\n\n---
 📥 *OPEN RECEIPT*
 ${downloadUrl}`;
+                  
+                  // Also send as a proper Document Attachment for better UX
+                  await whatsappService.sendDocument(from, downloadUrl, `Receipt_${result.data.id || 'Draft'}.pdf`);
                 } else {
-                    let finalUrl = result.file_url || `${config.botPublicUrl}/storage/${fileName}`;
-                    feedback += `\n\n---
+                  let finalUrl = result.file_url || `${config.botPublicUrl}/storage/${fileName}`;
+                  feedback += `\n\n---
 📸 *VIEW ATTACHMENT*
 ${finalUrl}`;
                 }
@@ -493,19 +521,69 @@ ${finalUrl}`;
         // --- Handle Invoice Confirmation ---
         if (state.state === 'AWAITING_INVOICE_CONFIRMATION') {
             if (textLower === 'confirm') {
+                this.logDebug('🚀 INVOICE CONFIRMATION START', { invoiceData: state.data.invoiceData });
+                
                 const result = await laravelService.createInvoice(state.data.invoiceData, state.data.filePath, from);
-                if (result.data && (result.data.pdf_url || result.data.id)) {
-                    const downloadUrl = result.data.pdf_url || `${laravelService.publicUrl}/api/bot/invoice/pdf/${result.data.id}`;
-                    // Send a clean text confirmation
-                    await whatsappService.sendTextMessage(from, "*Invoice Recorded Successfully* ✅");
+                this.logDebug('🧾 LARAVEL RESPONSE RECEIVED', result);
+                
+                // Laravel returns the signed URL in 'download_url'
+                if (result.data && (result.data.download_url || result.data.pdf_url || result.data.id)) {
+                    let downloadUrl = result.data.download_url || result.data.pdf_url || `${laravelService.publicUrl}/api/bot/invoice/pdf/${result.data.id}`;
                     
-                    // Send the actual PDF file as a Document Attachment
-                    await whatsappService.sendDocument(from, downloadUrl, `Invoice_${result.data.id}.pdf`);
+                    this.logDebug('🔗 GENERATED DOWNLOAD URL', { downloadUrl });
+
+                    // Defensive: Ensure we are not sending a localhost URL to Meta
+                    if (downloadUrl.includes('localhost') || downloadUrl.includes('127.0.0.1')) {
+                        this.logDebug('⚠️ WARNING: Localhost URL detected');
+                    }
+                    
+                    // 1. Deliver the document with a rich Professional Caption
+                    try {
+                        const date = result.data.date ? new Date(result.data.date).toLocaleDateString('en-GB') : 'N/A';
+                        const amount = parseFloat(result.data.total_ttc || result.data.amount || 0);
+                        const currency = result.data.currency || 'MAD';
+                        const fmtAmount = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + currency;
+                        const entityName = result.data.client_name || result.data.entity || 'N/A';
+
+                        const successText = `🧾 *INVOICE RECORDED*\n` +
+                                            `━━━━━━━━━━━━━━━━━━\n` +
+                                            `🏢 *Client:* ${entityName}\n` +
+                                            `💰 *Amount:* ${fmtAmount}\n` +
+                                            `📅 *Date:* ${date}\n` +
+                                            `📝 *Notes:* ${result.data.description || 'N/A'}\n` +
+                                            `━━━━━━━━━━━━━━━━━━\n` +
+                                            `✅ *Status:* Recorded Successfully`;
+
+                        const isPdfRoute = downloadUrl.includes('/pdf');
+                        const isImage = result.data.document_path && (
+                            result.data.document_path.toLowerCase().endsWith('.jpg') || 
+                            result.data.document_path.toLowerCase().endsWith('.jpeg') || 
+                            result.data.document_path.toLowerCase().endsWith('.png')
+                        );
+                        
+                        let waResult;
+                        if (!isPdfRoute && isImage) {
+                            // If it's explicitly an image and NOT a generated PDF route
+                            waResult = await whatsappService.sendImage(from, downloadUrl, successText);
+                        } else {
+                            // Otherwise send as document (PDF) with caption
+                            waResult = await whatsappService.sendDocument(from, downloadUrl, `Invoice_${result.data.id || 'Draft'}.pdf`, successText);
+                        }
+                        this.logDebug('✅ WHATSAPP MEDIA SENT', waResult);
+                    } catch (waErr) {
+                        this.logDebug('❌ WHATSAPP DELIVERY FAILED', waErr.message);
+                        // Fallback only if media fails
+                        await whatsappService.sendTextMessage(from, "✅ *Invoice Recorded Successfully*");
+                    }
                 } else {
-                    await whatsappService.sendTextMessage(from, "*Invoice Recorded Successfully*");
+                    this.logDebug('⚠️ WARNING: No valid ID or URL in response');
+                    await whatsappService.sendTextMessage(from, "✅ *Invoice Recorded Successfully*");
                 }
                 
+                // 2. Clear state and show menu
+                // We use a longer delay (2.5s) to ensure the PDF arrives before the menu
                 stateService.clearUserState(from);
+                await new Promise(resolve => setTimeout(resolve, 2500)); 
                 await this.sendWelcomeMenu(from);
             } else if (textLower === 'edit') {
                 stateService.setUserState(from, 'AWAITING_EDIT_SELECT_INVOICE', state.data);
@@ -623,15 +701,20 @@ ${finalUrl}`;
                 const result = await laravelService.uploadStatement(state.data.filePath, from, state.data.monthYear);
                 
                 let feedback = "*Bank statement successfully uploaded to the portal.*";
-                if (result.data && result.data.download_url) {
-                    feedback += `\n\n---
-📥 *OPEN STATEMENT*
-${result.data.download_url}`;
-                } else if (result.data && result.data.id) {
-                    const downloadUrl = `${laravelService.publicUrl}/api/bot/file/${result.data.id}`;
+                if (result.data && (result.data.download_url || result.data.id)) {
+                    const downloadUrl = result.data.download_url || `${laravelService.publicUrl}/api/bot/file/${result.data.id}`;
+                    
+                    if (downloadUrl.includes('localhost') || downloadUrl.includes('127.0.0.1')) {
+                        console.warn(`⚠️ [WARNING] Sending localhost URL to Meta (Statement): ${downloadUrl}`);
+                    }
+                    console.log(`📄 [INFO] Delivering Bank Statement: ${downloadUrl}`);
+
                     feedback += `\n\n---
 📥 *OPEN STATEMENT*
 ${downloadUrl}`;
+                    
+                    // Also send as a proper Document Attachment
+                    await whatsappService.sendDocument(from, downloadUrl, `Statement_${state.data.monthYear.replace(' ', '_')}.pdf`);
                 }
 
                 await whatsappService.sendTextMessage(from, feedback);
@@ -1839,18 +1922,29 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
         return whatsappService.sendTextMessage(from, `ℹ️ No transactions found for this period.`);
       }
 
-      // 2. Format list (Top 5)
+      // 2. Format list (Calculate total for ALL, but show only Top 10)
       const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
       const periodStr = month ? `${months[month-1]} ${year || ''}` : (year ? year : "All Time");
       
-      let response = `*${title}*\n` +
-                     `📅 *Period:* ${periodStr}\n` +
-                     `━━━━━━━━━━━━━━━━━━\n\n`;
+      let totalSum = 0;
+      let currency = 'MAD';
 
-      transactions.slice(0, 5).forEach((t, index) => {
+      // 1. Calculate TOTAL for everything found
+      transactions.forEach(t => {
+          let amount = 0;
+          if (type === 'inv') {
+              amount = (t.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0);
+          } else {
+              amount = parseFloat(t.total_ttc || t.ttc || 0);
+          }
+          totalSum += amount;
+          if (t.currency) currency = t.currency;
+      });
+
+      // 2. Build rows for only Top 10 (WhatsApp Limit)
+      const rows = transactions.slice(0, 10).map((t) => {
         const date = t.date ? new Date(t.date).toLocaleDateString('en-GB') : 'N/A';
         
-        // Calculate amount logic (Unified for VAT and TTC)
         let amount = 0;
         if (type === 'inv') {
           amount = (t.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0);
@@ -1858,25 +1952,96 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
           amount = parseFloat(t.total_ttc || t.ttc || 0);
         }
 
-        const currency = t.currency || 'MAD';
-        const fmtAmount = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + currency;
-        
-        response += `${index + 1}. *${date}* — ${fmtAmount}\n`;
-        if (t.download_url) {
-          response += `🔗 [OPEN DOCUMENT](${t.download_url})\n`;
-        }
-        response += `\n`;
+        const fmtAmount = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + (t.currency || currency);
+        const prefix = type === 'inv' ? 'v_inv_' : 'v_exp_';
+
+        return {
+           id: `${prefix}${t.id}`,
+           title: `${date} — ${fmtAmount}`,
+           description: t.notes || (type === 'inv' ? `Invoice #${t.id}` : `Expense #${t.id}`)
+        };
       });
 
-      if (transactions.length > 5) {
-        response += `_Showing last 5 of ${transactions.length} records._\n`;
-      }
+      const fmtTotal = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2 }).format(totalSum) + ' ' + currency;
+      
+      const bodyText = `*${title}*\n` +
+                       `📅 *Period:* ${periodStr}\n` +
+                       `💰 *Total:* ${fmtTotal}\n\n` +
+                       `I found ${transactions.length} records. Tap below to view or download a specific document:`;
 
-      await whatsappService.sendTextMessage(from, response);
+      const sections = [{
+          title: "Select Document",
+          rows: rows
+      }];
+
+      await whatsappService.sendInteractiveList(from, bodyText, "View Documents", sections);
 
     } catch (error) {
       console.error('handleListTransactions error:', error);
       await whatsappService.sendTextMessage(from, "❌ Sorry, I encountered an error while fetching the transaction list.");
+    }
+  }
+  /**
+   * Fetch and deliver a specific invoice or expense document natively
+   */
+  async handleDeliverSpecificMedia(from, type, id) {
+    try {
+      let document = null;
+      let label = "";
+
+      if (type === 'inv') {
+        const results = await laravelService.getInvoices(from, null, null, null, null, id);
+        document = results.length > 0 ? results[0] : null;
+        label = "Invoice";
+      } else {
+        const results = await laravelService.getExpenses(from, null, null, null, id);
+        document = results.length > 0 ? results[0] : null;
+        label = "Expense";
+      }
+
+      if (!document || !document.download_url) {
+        return whatsappService.sendTextMessage(from, `❌ Sorry, I couldn't find the original file for ${label} #${id}.`);
+      }
+
+      const date = document.date ? new Date(document.date).toLocaleDateString('en-GB') : 'N/A';
+      
+      // Calculate amount
+      let amount = 0;
+      if (type === 'inv') {
+        amount = (document.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0);
+      } else {
+        amount = parseFloat(document.total_ttc || document.ttc || 0);
+      }
+      const currency = document.currency || 'MAD';
+      const fmtAmount = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + currency;
+      const entityName = type === 'inv' ? (document.client?.client_name || 'N/A') : (document.supplier?.supplier_name || 'N/A');
+      const entityLabel = type === 'inv' ? 'Client' : 'Supplier';
+
+      const successText = `🧾 *${label.toUpperCase()} DOCUMENT*\n` +
+                          `━━━━━━━━━━━━━━━━━━\n` +
+                          `🏢 *${entityLabel}:* ${entityName}\n` +
+                          `💰 *Amount:* ${fmtAmount}\n` +
+                          `📅 *Date:* ${date}\n` +
+                          `📝 *Notes:* ${document.notes || document.description || 'N/A'}\n` +
+                          `━━━━━━━━━━━━━━━━━━\n` +
+                          `✅ *Status:* ${document.status || 'Recorded'}`;
+      
+      const isPdfRoute = document.download_url.includes('/pdf');
+      const isImage = document.document_path && (
+          document.document_path.toLowerCase().endsWith('.jpg') || 
+          document.document_path.toLowerCase().endsWith('.jpeg') || 
+          document.document_path.toLowerCase().endsWith('.png')
+      );
+
+      if (!isPdfRoute && isImage) {
+          await whatsappService.sendImage(from, document.download_url, successText);
+      } else {
+          await whatsappService.sendDocument(from, document.download_url, `${label}_${id}.pdf`, successText);
+      }
+
+    } catch (error) {
+      console.error('handleDeliverSpecificMedia error:', error);
+      await whatsappService.sendTextMessage(from, "❌ Sorry, I encountered an error while delivering that document.");
     }
   }
 }

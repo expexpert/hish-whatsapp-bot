@@ -155,12 +155,13 @@ class WhatsAppService {
   }
 
   /**
-   * Send a real file (PDF, Image) as a downloadable document
+   * Send a real file (PDF, etc.) as a downloadable document
    * @param {string} to - Recipient phone number
    * @param {string} url - Publicly accessible URL of the file
    * @param {string} filename - Display name for the file
+   * @param {string} caption - Optional caption text
    */
-  async sendDocument(to, url, filename) {
+  async sendDocument(to, url, filename, caption = null) {
     const apiURL = `${this.baseUrl}/${this.phoneNumberId}/messages`;
     const payload = {
       messaging_product: 'whatsapp',
@@ -173,6 +174,10 @@ class WhatsAppService {
       }
     };
 
+    if (caption) {
+      payload.document.caption = caption;
+    }
+
     try {
       const response = await axios.post(apiURL, payload, {
         headers: {
@@ -183,6 +188,42 @@ class WhatsAppService {
       return response.data;
     } catch (error) {
       console.error('WhatsApp Send Document Error:', error.response ? error.response.data : error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Send a native image message
+   * @param {string} to - Recipient phone number
+   * @param {string} url - Publicly accessible URL of the image
+   * @param {string} caption - Optional caption text
+   */
+  async sendImage(to, url, caption = null) {
+    const apiURL = `${this.baseUrl}/${this.phoneNumberId}/messages`;
+    const payload = {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: to,
+      type: 'image',
+      image: {
+        link: url
+      }
+    };
+
+    if (caption) {
+      payload.image.caption = caption;
+    }
+
+    try {
+      const response = await axios.post(apiURL, payload, {
+        headers: {
+          'Authorization': `Bearer ${this.accessToken}`,
+          'Content-Type': 'application/json'
+        }
+      });
+      return response.data;
+    } catch (error) {
+      console.error('WhatsApp Send Image Error:', error.response ? error.response.data : error.message);
       throw error;
     }
   }

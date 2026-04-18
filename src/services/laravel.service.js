@@ -8,11 +8,20 @@ class LaravelService {
   }
 
   getBotHeaders(phone = null, skipCooldown = false) {
+    // Extract host from publicUrl (e.g., https://domain.com -> domain.com)
+    const publicHost = this.publicUrl ? this.publicUrl.replace(/^https?:\/\//, '').split('/')[0] : null;
+    const isHttps = this.publicUrl && this.publicUrl.startsWith('https');
+
     const headers = {
       'X-Bot-Secret': this.botSecret,
       'X-Customer-Phone': phone,
       'Accept': 'application/json'
     };
+
+    if (publicHost) {
+      headers['X-Forwarded-Host'] = publicHost;
+      headers['X-Forwarded-Proto'] = isHttps ? 'https' : 'http';
+    }
 
     if (skipCooldown) {
       headers['X-AI-Skip-Cooldown'] = 'true';
@@ -133,10 +142,10 @@ class LaravelService {
     }
   }
 
-  async getInvoices(phone, status = null, month = null, year = null, clientId = null) {
+  async getInvoices(phone, status = null, month = null, year = null, clientId = null, id = null) {
     try {
       const response = await axios.get(`${this.baseUrl}/customer/customer-invoices`, {
-        params: { status, month, year, client_id: clientId },
+        params: { status, month, year, client_id: clientId, id },
         headers: this.getBotHeaders(phone)
       });
       return response.data.data || [];
@@ -146,10 +155,10 @@ class LaravelService {
     }
   }
 
-  async getExpenses(phone, month = null, year = null, supplierId = null) {
+  async getExpenses(phone, month = null, year = null, supplierId = null, id = null) {
     try {
       const response = await axios.get(`${this.baseUrl}/customer/customer-expenses`, {
-        params: { month, year, supplier_id: supplierId },
+        params: { month, year, supplier_id: supplierId, id },
         headers: this.getBotHeaders(phone)
       });
       return response.data.data || [];
