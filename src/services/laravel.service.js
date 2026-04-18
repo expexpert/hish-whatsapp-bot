@@ -89,22 +89,23 @@ class LaravelService {
       return {
         month: periodLabel,
         status: data.is_enable_login ? 'Active' : 'Pending',
-        totalDocuments: (parseInt(data.total_paid_count) || 0) + (parseInt(data.total_issued_count) || 0) + (parseInt(data.total_expenses_count) || 0),
-        invoicesCount: (parseInt(data.total_paid_count) || 0) + (parseInt(data.total_issued_count) || 0),
+        totalDocuments: (parseInt(data.total_issued_count) || 0) + (parseInt(data.total_expenses_count) || 0),
+        invoicesCount: parseInt(data.total_issued_count) || 0,
         expensesCount: parseInt(data.total_expenses_count) || 0,
-        // Corrected Flat Mappings (Matches CustomerController.php json response)
-        salesSum: parseFloat(data.revenue) || 0,
-        cash_revenue_sum: parseFloat(data.revenue) || 0,
+
+        // Core Financials (Mapped to Main Branch Logic)
+        salesSum: parseFloat(data.total_issued_paid_sum) || 0,
+        cash_revenue_sum: parseFloat(data.total_paid_sum) || 0,
         total_unpaid_sum: parseFloat(data.unpaidInvoiceSum) || 0,
         total_quote_sum: parseFloat(data.total_quote_sum) || 0,
-        cash_vat_sum: parseFloat(data.total_vat_payable) || 0, // Aligning with standardized VAT
+        cash_vat_sum: parseFloat(data.total_vat_payable) || 0,
         total_paid_sum: parseFloat(data.total_paid_sum) || 0,
         
-        pendingReviewCount: parseInt(data.pendingReviewCount) || 0,
-        statementsCount: parseInt(data.statementsCount) || 0,
+        pendingReviewCount: parseInt(data.total_pending_review_count) || 0,
+        statementsCount: parseInt(data.bank_statements_count) || 0,
         
-        expensesSum: parseFloat(data.expense) || 0,
-        total_expenses_sum: parseFloat(data.expense) || 0,
+        expensesSum: parseFloat(data.total_expenses_sum) || 0,
+        total_expenses_sum: parseFloat(data.total_expenses_sum) || 0,
         expenseVat: parseFloat(data.total_expenses_vat) || 0,
         vatPayable: parseFloat(data.total_vat_payable) || 0,
         recentDocuments: [] 

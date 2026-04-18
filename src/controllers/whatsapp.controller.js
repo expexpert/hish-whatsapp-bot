@@ -311,7 +311,11 @@ class WhatsAppController {
               
               if (!isAudio) {
                 feedback += "\nYour document has been synchronized with the portal.";
-                if (result.data && result.data.id) {
+                if (result.data && result.data.download_url) {
+                    feedback += `\n\n---
+📥 *OPEN RECEIPT*
+${result.data.download_url}`;
+                } else if (result.data && result.data.id) {
                     const downloadUrl = `${laravelService.publicUrl}/api/bot/file/${result.data.id}`;
                     feedback += `\n\n---
 📥 *OPEN RECEIPT*
@@ -408,8 +412,8 @@ ${finalUrl}`;
         if (state.state === 'AWAITING_INVOICE_CONFIRMATION') {
             if (textLower === 'confirm') {
                 const result = await laravelService.createInvoice(state.data.invoiceData, state.data.filePath, from);
-                if (result.data && result.data.id) {
-                    const downloadUrl = `${laravelService.publicUrl}/api/bot/invoice/pdf/${result.data.id}`;
+                if (result.data && (result.data.pdf_url || result.data.id)) {
+                    const downloadUrl = result.data.pdf_url || `${laravelService.publicUrl}/api/bot/invoice/pdf/${result.data.id}`;
                     // Send a clean text confirmation
                     await whatsappService.sendTextMessage(from, "*Invoice Recorded Successfully* ✅");
                     
@@ -537,7 +541,11 @@ ${finalUrl}`;
                 const result = await laravelService.uploadStatement(state.data.filePath, from, state.data.monthYear);
                 
                 let feedback = "*Bank statement successfully uploaded to the portal.*";
-                if (result.data && result.data.id) {
+                if (result.data && result.data.download_url) {
+                    feedback += `\n\n---
+📥 *OPEN STATEMENT*
+${result.data.download_url}`;
+                } else if (result.data && result.data.id) {
                     const downloadUrl = `${laravelService.publicUrl}/api/bot/file/${result.data.id}`;
                     feedback += `\n\n---
 📥 *OPEN STATEMENT*
