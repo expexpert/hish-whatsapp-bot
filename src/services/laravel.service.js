@@ -34,7 +34,6 @@ class LaravelService {
       const response = await axios.get(`${this.baseUrl}/customer/profile`, {
         headers: this.getBotHeaders(phone)
       });
-      console.log(`📡 [DEBUG] Profile response for ${phone}: Status ${response.status}`);
       // If the middleware didn't find the user, data will be null
       return response.data.data !== null;
     } catch (error) {
@@ -89,8 +88,8 @@ class LaravelService {
       return {
         month: periodLabel,
         status: data.is_enable_login ? 'Active' : 'Pending',
-        totalDocuments: (parseInt(data.total_issued_count) || 0) + (parseInt(data.total_expenses_count) || 0),
-        invoicesCount: parseInt(data.total_issued_count) || 0,
+        totalDocuments: (parseInt(data.total_issued_count) || 0) + (parseInt(data.total_paid_count) || 0) + (parseInt(data.total_expenses_count) || 0),
+        invoicesCount: (parseInt(data.total_issued_count) || 0) + (parseInt(data.total_paid_count) || 0),
         expensesCount: parseInt(data.total_expenses_count) || 0,
 
         // Core Financials (Mapped to Main Branch Logic)
@@ -108,12 +107,16 @@ class LaravelService {
         total_expenses_sum: parseFloat(data.total_expenses_sum) || 0,
         expenseVat: parseFloat(data.total_expenses_vat) || 0,
         vatPayable: parseFloat(data.total_vat_payable) || 0,
-        recentDocuments: [] 
+        recentDocuments: [],
+        targetMonth: monthNum,
+        targetYear: currentYear
       };
     } catch (error) {
       console.error('Laravel Hybrid Status Error:', error.response?.data || error.message);
       return { 
         month: new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' }),
+        targetMonth: String(new Date().getMonth() + 1).padStart(2, '0'),
+        targetYear: new Date().getFullYear(),
         status: 'Error fetching data',
         documentsReceived: 0,
         salesSum: 0,
@@ -127,6 +130,51 @@ class LaravelService {
         vatPayable: 0,
         recentDocuments: []
       };
+    }
+  }
+
+  async getInvoices(phone, status = null, month = null, year = null, clientId = null) {
+    try {
+      const response = await axios.get(`${this.baseUrl}/customer/customer-invoices`, {
+        params: { status, month, year, client_id: clientId },
+        headers: this.getBotHeaders(phone)
+      });
+      return response.data.data || [];
+    } catch (error) {
+      console.error('getInvoices error:', error.message);
+      return [];
+    }
+  }
+
+  async getExpenses(phone, month = null, year = null, supplierId = null) {
+    try {
+      const response = await axios.get(`${this.baseUrl}/customer/customer-expenses`, {
+        params: { month, year, supplier_id: supplierId },
+        headers: this.getBotHeaders(phone)
+      });
+      return response.data.data || [];
+    } catch (error) {
+      console.error('getExpenses error:', error.message);
+      return [];
+    }
+  }
+
+  async getBankStatements(phone, month = null, year = null) {
+    try {
+      // Logic for statements: if month/year provided, we could filter by STR_TO_DATE.
+      // For now, we'll pass filter if only year provided, or just let backend handle pagination.
+      const params = {};
+      if (year && month) params.filter = `${month}-${year}`;
+      else if (year) params.filter = year;
+
+      const response = await axios.get(`${this.baseUrl}/customer/bank-statements`, {
+        params,
+        headers: this.getBotHeaders(phone)
+      });
+      return response.data.data || [];
+    } catch (error) {
+      console.error('getBankStatements error:', error.message);
+      return [];
     }
   }
 

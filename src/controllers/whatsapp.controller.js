@@ -10,6 +10,7 @@ const fs = require('fs');
 class WhatsAppController {
   constructor() {
     this.processedMessageIds = new Set();
+    this.userQueues = new Map(); // Per-user message queue
     // Periodically clear old IDs to prevent memory leak
     setInterval(() => this.processedMessageIds.clear(), 3600000); // Every hour
   }
@@ -51,8 +52,28 @@ class WhatsAppController {
               }
               this.processedMessageIds.add(message.id);
               
-              this.processMessage(message).catch(err => {
-                console.error('❌ BACKGROUND PROCESSING ERROR:', err);
+              // 4. Sequential Queueing per User
+              const from = message.from;
+              if (!this.userQueues.has(from)) {
+                this.userQueues.set(from, Promise.resolve());
+              }
+
+              const currentQueue = this.userQueues.get(from);
+              const nextInQueue = currentQueue.then(async () => {
+                try {
+                  await this.processMessage(message);
+                } catch (err) {
+                  console.error(`❌ ERROR PROCESSING MESSAGE ${message.id} for ${from}:`, err);
+                }
+              });
+
+              this.userQueues.set(from, nextInQueue);
+              
+              // Cleanup queue reference when finished to prevent memory leaks
+              nextInQueue.finally(() => {
+                if (this.userQueues.get(from) === nextInQueue) {
+                  this.userQueues.delete(from);
+                }
               });
             }
           }
@@ -72,10 +93,24 @@ class WhatsAppController {
       let isAuth = config.bypassAuth === true;
       
       if (!isAuth) {
-        isAuth = await laravelService.checkAuth(from);
-        console.log(`🔍 [DEBUG] Auth check result for ${from}: ${isAuth}`);
-      } else {
-        console.log(`📡 [BYPASS] Activation check bypassed for ${from}`);
+        // 1. Check if we are in a back-off period (Negative Cache)
+        if (stateService.isBlocked(from)) {
+          return; // Exit silently during back-off
+        }
+
+        // 2. Check cache first
+        const cachedAuth = stateService.getAuthStatus(from);
+        if (cachedAuth !== null) {
+          isAuth = cachedAuth;
+        } else {
+          isAuth = await laravelService.checkAuth(from);
+          if (isAuth) {
+            stateService.setAuthStatus(from, true);
+          } else {
+            // Failure! Back-off for 30s
+            stateService.setBlockedStatus(from);
+          }
+        }
       }
 
       if (!isAuth) {
@@ -177,7 +212,7 @@ class WhatsAppController {
         }
 
         // --- NEW: AI INTENT SENSING FOR UNHANDLED TEXT ---
-        if (!detectedIntent && type === 'text' && state.state === 'IDLE') {
+        if (!detectedIntent && (type === 'text' || type === 'audio') && state.state === 'IDLE') {
             const greetings = ['hi', 'hello', 'hey', 'bonjour', 'salam', 'ola'];
             if (!greetings.includes(textLower)) {
                 const aiIntent = await aiService.classifyIntent(text, from, true);
@@ -193,12 +228,58 @@ class WhatsAppController {
             }
         }
 
-        // Handle global quick report selections (Exclude during active sub-flows)
+        // Handle global quick report selections (Exclude during active sub flows)
         if (interactiveId && interactiveId.startsWith('rep_') && 
             state.state !== 'AWAITING_REPORT_DISAMBIGUATION' && 
             state.state !== 'AWAITING_REPORT_PERIOD') {
              await this.handleReportMenuSelection(from, interactiveId);
              return;
+        }
+
+        // --- NEW: Handle Dynamic List Selections ---
+        if (interactiveId && (interactiveId.startsWith('list_inv_') || interactiveId.startsWith('list_exp_'))) {
+            const parts = interactiveId.split('_');
+            const type = parts[1]; // inv or exp
+            const entityId = parts[2];
+            const month = parts[3] === '00' ? null : parseInt(parts[3]);
+            const year = parts[4] === '0000' ? null : parseInt(parts[4]);
+            
+            await this.handleListTransactions(from, type, entityId, month, year);
+            return;
+        }
+
+        // --- NEW: Handle Dynamic Record Selections (Context-Aware) ---
+        if (interactiveId && (interactiveId.startsWith('record_exp_') || interactiveId.startsWith('record_inv_'))) {
+            const parts = interactiveId.split('_');
+            const typeValue = parts[1]; // exp or inv
+            const entityId = parts[2];
+            
+            // Look up entity name for a better UX
+            let entityName = "Selection";
+            if (typeValue === 'exp') {
+                const suppliers = await laravelService.getSuppliers(from);
+                const supplier = suppliers.find(s => s.id == entityId);
+                if (supplier) entityName = supplier.name;
+            } else {
+                const clients = await laravelService.getClients(from);
+                const client = clients.find(c => c.id == entityId);
+                if (client) entityName = client.company_name || client.client_name;
+            }
+
+            stateService.clearUserState(from);
+            
+            if (typeValue === 'exp') {
+                stateService.setUserState(from, 'AWAITING_EXPENSE_DATA', { 
+                    expenseData: { entity: entityName, supplier_id: entityId } 
+                });
+                await whatsappService.sendTextMessage(from, `✍️ *Recording expense for ${entityName}*...\n\nPlease provide the details (e.g., '150.00 for office supplies') or upload a receipt photo.`);
+            } else {
+                stateService.setUserState(from, 'AWAITING_INVOICE_DATA', { 
+                    invoiceData: { client_name: entityName, client_id: entityId } 
+                });
+                await whatsappService.sendTextMessage(from, `✍️ *Recording invoice for ${entityName}*...\n\nPlease provide the details (e.g., '500.00 for consulting services') or upload the document.`);
+            }
+            return;
         }
 
         if (detectedIntent) {
@@ -211,7 +292,7 @@ class WhatsAppController {
                                 (detectedIntent === 'invoice' && state.state === 'AWAITING_INVOICE_DATA') ||
                                 (detectedIntent === 'statement' && state.state === 'AWAITING_STATEMENT_DATA');
             
-            const isDirectData = type === 'text' && text.split(' ').length > 2 && (detectedIntent === 'expense' || detectedIntent === 'invoice');
+            const isDirectData = (type === 'text' || type === 'audio') && text.split(' ').length > 2 && (detectedIntent === 'expense' || detectedIntent === 'invoice');
 
             if ((isReTrigger || isDirectData) && (type === 'text' || type === 'audio' || type === 'voice')) {
                 console.log(`♻️ RE-TRIGGER OR DIRECT DATA: Skipping intent reset to allow parsing logic to take over.`);
@@ -225,6 +306,9 @@ class WhatsAppController {
                         await this.sendWelcomeMenu(from);
                         return;
                     case 'status':
+                        if (type === 'text' || type === 'audio') {
+                            return this.handleReportQuery(from, text);
+                        }
                         await whatsappService.sendTextMessage(from, "Retrieving your account status summary...");
                         const stats = await laravelService.getAccountStatus(from);
                         await this.sendStatusInteractive(from, stats);
@@ -258,23 +342,21 @@ class WhatsAppController {
             const aiIntent = await aiService.classifyIntent(text, from, true);
             if (aiIntent !== 'UNKNOWN' && aiIntent !== 'MENU') {
                 console.log(`🤖 AI SWITCH DETECTED: -> ${aiIntent}`);
-                stateService.clearUserState(from);
+                
+        // --- STATE PROTECTION: Do not clear if we are ALREADY in the same flow ---
+        const isMatchingFlow = (aiIntent === 'EXPENSE' && state.state.includes('EXPENSE')) ||
+                               (aiIntent === 'INVOICE' && state.state.includes('INVOICE')) ||
+                               (aiIntent === 'STATEMENT' && state.state.includes('STATEMENT'));
+        
+        if (!isMatchingFlow) {
+          stateService.clearUserState(from);
+        } else {
+          console.log(`🛡️ Persisting current context: Detected ${aiIntent} intent matches active ${state.state} flow.`);
+        }
                 
                 if (aiIntent === 'STATUS') {
-                    // SECONDARY CHECK: If it mentioned a month/year, it's actually a report
-                    const months = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december', 'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec', 'last month'];
-                    const hasMonth = months.some(m => textLower.includes(m));
-                    const hasReport = textLower.includes('report') || textLower.includes('summary') || textLower.includes('total');
-                    
-                    if (hasMonth || hasReport) {
-                        console.log(`🤖 AI INTENT CORRECTION: STATUS -> REPORT (Date/Summary detected)`);
-                        return this.handleReportQuery(from, text);
-                    }
-
-                    await whatsappService.sendTextMessage(from, "Retrieving your account status summary (AI detected)...");
-                    const stats = await laravelService.getAccountStatus(from);
-                    await this.sendStatusInteractive(from, stats);
-                    return;
+                    console.log(`🤖 AI STATUS INTENT detected: routing to handleReportQuery`);
+                    return this.handleReportQuery(from, text);
                 } else if (aiIntent === 'EXPENSE') {
                     console.log(`🤖 AI SWITCH DETECTED: -> EXPENSE (Data provided in sentence)`);
                     // Fall through to parsing logic below
@@ -811,15 +893,31 @@ ${downloadUrl}`;
    */
   async handleDocumentRouting(from, data, filePath, type) {
     const currentState = await stateService.getUserState(from);
+    console.log(`[DEBUG] ROUTING START - State: ${currentState?.state}`);
     const existingData = (currentState && currentState.data) ? (currentState.data.expenseData || currentState.data.invoiceData || {}) : {};
+    console.log(`[DEBUG] Existing Data:`, JSON.stringify(existingData));
     const today = new Date().toISOString().split('T')[0];
     const invalidVals = ['unknown', 'general', 'n/a', 'none', 'null', 'undefined', ''];
+    
+    // --- MEMOIZATION HELPERS: Ensure we only fetch these lists once per request ---
+    let cachedSuppliers = null;
+    let cachedClients = null;
+
+    const fetchSuppliers = async () => {
+      if (!cachedSuppliers) cachedSuppliers = await laravelService.getSuppliers(from);
+      return cachedSuppliers;
+    };
+
+    const fetchClients = async () => {
+      if (!cachedClients) cachedClients = await laravelService.getClients(from);
+      return cachedClients;
+    };
 
     let mergedData = { 
         payment_method: 'WhatsApp',
         ...data 
     };
-
+console.log(data,  "kjlkjlkjlkjlkjlkj")
     // --- 1. NORMALIZATION (AI -> Internal Fields) ---
     // Move AI 'entity' to 'client_name' or 'supplier_name' before merging
     if (mergedData.documentType === 'INVOICE' && mergedData.entity && !invalidVals.includes(mergedData.entity.toLowerCase())) {
@@ -868,12 +966,31 @@ ${downloadUrl}`;
 
         // Client Name priority: New (if valid) > Old
         const newClientName = mergedData.client_name || mergedData.entity;
-        if (newClientName && !invalidVals.includes(newClientName.toLowerCase())) {
-            // IF new name is different from old name, CLEAR the client_id to force re-lookup
-            if (existingData.client_name && existingData.client_name.toLowerCase() !== newClientName.toLowerCase()) {
-                mergedData.client_id = null;
+        const isClientValid = newClientName && !invalidVals.includes(newClientName.toLowerCase());
+        
+        if (isClientValid) {
+            // ONLY clear the context ID if the NEW name is actually a match for a DIFFERENT known client
+            // This prevents "Utilities" or other noise from clearing your selected context
+            if (existingData.client_id && existingData.client_name && existingData.client_name.toLowerCase() !== newClientName.toLowerCase()) {
+                const clients = await fetchClients();
+                const searchName = newClientName.toLowerCase().replace(/[.!]$/, '').trim();
+                const isAnotherKnownClient = clients.some(c => 
+                    (c.company_name && c.company_name.toLowerCase().replace(/[.!]$/, '').trim() === searchName) ||
+                    (c.client_name && c.client_name.toLowerCase().replace(/[.!]$/, '').trim() === searchName)
+                );
+                
+                if (isAnotherKnownClient) {
+                    mergedData.client_id = null;
+                    mergedData.client_name = newClientName;
+                } else {
+                    // It's probably noise, stick to the context
+                    mergedData.client_id = existingData.client_id;
+                    mergedData.client_name = existingData.client_name;
+                    mergedData.entity = existingData.client_name; // Sync entity field too
+                }
+            } else {
+                mergedData.client_name = newClientName;
             }
-            mergedData.client_name = newClientName;
         } else if (existingData.client_name) {
             mergedData.client_name = existingData.client_name;
         }
@@ -908,8 +1025,28 @@ ${downloadUrl}`;
         // STRICTLY preserve original type and data during an active session
         if (currentState.state.includes('EXPENSE')) {
             mergedData.documentType = 'EXPENSE';
-            if (existingData.supplier_id && (!mergedData.entity || invalidVals.includes(mergedData.entity.toLowerCase()))) {
+            console.log(mergedData, "mergedDatamergedData")
+            const newEntityName = mergedData.entity;
+            const isEntityValid = newEntityName && !invalidVals.includes(newEntityName.toLowerCase());
+
+            if (isEntityValid && existingData.supplier_id && existingData.entity && existingData.entity.toLowerCase() !== newEntityName.toLowerCase()) {
+                // Check if the NEW name is actually another known supplier
+                const suppliers = await fetchSuppliers();
+                const searchName = newEntityName.toLowerCase().replace(/[.!]$/, '').trim();
+                const isAnotherKnownSupplier = suppliers.some(s => s.name && s.name.toLowerCase().replace(/[.!]$/, '').trim() === searchName);
+                
+                if (isAnotherKnownSupplier) {
+                    console.log(`[DEBUG] Detected context switch to another known supplier: ${newEntityName}`);
+                    mergedData.supplier_id = null;
+                } else {
+                    console.log(`[DEBUG] Potential noise detected: "${newEntityName}". Restoring context: ${existingData.entity}`);
+                    mergedData.supplier_id = existingData.supplier_id;
+                    mergedData.entity = existingData.entity;
+                }
+            } else if (existingData.supplier_id && (!mergedData.entity || invalidVals.includes(mergedData.entity.toLowerCase()))) {
+                console.log(`[DEBUG] Missing/Invalid entity from AI. Restoring context: ${existingData.entity}`);
                 mergedData.supplier_id = existingData.supplier_id;
+                mergedData.entity = existingData.entity;
             }
         } else if (currentState.state.includes('INVOICE')) {
             mergedData.documentType = 'INVOICE';
@@ -941,7 +1078,7 @@ ${downloadUrl}`;
     const sanitize = (val) => val ? val.toLowerCase().replace(/[.!]$/, '').trim() : '';
     
     if (mergedData.client_name && !mergedData.client_id && mergedData.documentType === 'INVOICE') {
-        const clients = await laravelService.getClients(from);
+        const clients = await fetchClients();
         const searchName = sanitize(mergedData.client_name);
         
         const match = clients.find(c => 
@@ -953,7 +1090,7 @@ ${downloadUrl}`;
             mergedData.client_name = match.company_name || match.client_name;
         }
     } else if (mergedData.entity && mergedData.entity !== 'General' && !mergedData.supplier_id && mergedData.documentType === 'EXPENSE') {
-        const suppliers = await laravelService.getSuppliers(from);
+        const suppliers = await fetchSuppliers();
         const searchName = sanitize(mergedData.entity);
         
         const match = suppliers.find(s => sanitize(s.name) === searchName);
@@ -1005,7 +1142,7 @@ ${downloadUrl}`;
         // 2. Client Check
         const isNameInvalid = !inv.client_name || invalidValues.includes(inv.client_name.toLowerCase());
         if (!inv.client_id && isNameInvalid) {
-            const clients = await laravelService.getClients(from);
+            const clients = await fetchClients();
             if (clients && clients.length > 0) {
                 stateService.setUserState(from, 'AWAITING_INVOICE_CLIENT', { filePath, invoiceData: inv });
                 await this.sendClientSelectionList(from, clients);
@@ -1053,8 +1190,8 @@ ${downloadUrl}`;
                 const categories = await laravelService.getCategories(from);
                 stateService.setUserState(from, 'AWAITING_EXPENSE_CATEGORY', { expenseData: mergedData, receiptPath: filePath });
                 await this.sendCategorySelectionList(from, categories);
-            } else if (!mergedData.entity || invalidValues.includes(mergedData.entity.toLowerCase())) {
-                const suppliers = await laravelService.getSuppliers(from);
+            } else if (!mergedData.supplier_id && (!mergedData.entity || invalidValues.includes(mergedData.entity.toLowerCase()))) {
+                const suppliers = await fetchSuppliers();
                 if (suppliers && suppliers.length > 0) {
                     stateService.setUserState(from, 'AWAITING_EXPENSE_ENTITY', { expenseData: mergedData, receiptPath: filePath });
                     await this.sendSupplierSelectionList(from, suppliers);
@@ -1141,7 +1278,13 @@ ${downloadUrl}`;
           await this.sendStatusInteractive(from, stats);
       } else if (interactiveId === 'rep_gen_unpaid') {
           const stats = await laravelService.getAccountStatus(from);
-          await whatsappService.sendTextMessage(from, `🚨 *Unpaid Invoices Alert*\n\nYou currently have ${stats.total_unpaid_sum} pending to be paid by your clients across ${stats.total_issued_count} issued invoices.\n\n_Log in to your portal to view full details._`);
+          if (stats.total_unpaid_sum > 0) {
+              await whatsappService.sendTextMessage(from, `🚨 *Unpaid Invoices Alert*\n\nYou currently have *${stats.total_unpaid_sum}* pending to be paid by your clients across *${stats.invoicesCount}* issued invoices.\n\n_Log in to your portal to view full details._`);
+          } else if (stats.invoicesCount > 0) {
+              await whatsappService.sendTextMessage(from, `✅ *Great news!*\n\nAll your *${stats.invoicesCount}* issued invoices have been fully paid. Your accounts are currently up to date.`);
+          } else {
+              await whatsappService.sendTextMessage(from, `ℹ️ *No Invoices Found*\n\nYou haven't issued any invoices yet. You can start by sending a document or typing 'Create Invoice'.`);
+          }
       } else if (interactiveId === 'rep_gen_search') {
           stateService.setUserState(from, 'AWAITING_REPORT_SEARCH');
           await whatsappService.sendTextMessage(from, "🔍 Please type the name of the Client or Supplier you are looking for:");
@@ -1202,9 +1345,18 @@ ${downloadUrl}`;
   }
 
   async sendStatusInteractive(from, stats) {
+    const { targetMonth, targetYear } = stats;
+
+    // 1. Parallel fetch details (Invoices, Expenses, Statements) - Synchronized with target period
+    const [invoices, expenses, statements] = await Promise.all([
+      laravelService.getInvoices(from, 'ISSUED', targetMonth, targetYear),
+      laravelService.getExpenses(from, targetMonth, targetYear),
+      laravelService.getBankStatements(from, targetMonth, targetYear)
+    ]);
+
     const income = stats.salesSum || 0;
-    const expenses = stats.expensesSum || 0;
-    const balance = income - expenses;
+    const expensesTotal = stats.expensesSum || 0;
+    const balance = income - expensesTotal;
     const vat = stats.vatPayable || 0;
     
     let statusIcon = '⚪';
@@ -1229,6 +1381,46 @@ ${downloadUrl}`;
     const missing = [];
     if (!stats.statementsCount) missing.push('Bank Statement');
     if (stats.invoicesCount === 0) missing.push('Invoices');
+
+    // Currency formatting
+    const currency = stats.currency || 'MAD';
+    const fmt = (num) => {
+        const val = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(num);
+        return `${val} ${currency}`;
+    };
+
+    // --- DETAILED SECTIONS ---
+    let detailText = '';
+
+    // Unpaid Invoices List
+    if (invoices.length > 0) {
+        detailText += `📑 *Unpaid Invoices (Top 3):*\n`;
+        invoices.slice(0, 3).forEach(inv => {
+            const client = inv.client?.client_name || 'Client';
+            // Sum HT as a reasonable summary
+            const amount = (inv.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0);
+            detailText += `• ${client}: ${fmt(amount)}\n`;
+        });
+        detailText += `\n`;
+    }
+
+    // Recent Expenses List
+    if (expenses.length > 0) {
+        detailText += `🏷️ *Recent Expenses (Top 3):*\n`;
+        expenses.slice(0, 3).forEach(exp => {
+            const category = exp.category?.name || 'General';
+            const amount = parseFloat(exp.total_ttc || 0);
+            detailText += `• ${category}: ${fmt(amount)}\n`;
+        });
+        detailText += `\n`;
+    }
+
+    // Statement History Hint
+    if (statements.length > 0) {
+        const last = statements[0]; // Sorted DESC in backend
+        detailText += `📅 *Last Statement:* ${last.month_year} (${last.status || 'Processed'})\n\n`;
+    }
+
     const missingText = missing.length > 0 
         ? `⚠️ *Missing:* ${missing.join(', ')}\n_(Please upload these to the portal or send them here)_` 
         : (statusIcon === '🟢' 
@@ -1237,26 +1429,18 @@ ${downloadUrl}`;
                 ? `🟠 *Note:* Some transaction receipts or missing details still need your attention in the portal.`
                 : '✅ *All required documents received for this month.*'));
 
-    // Currency formatting
-    const fmt = (num) => {
-        const val = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(num);
-        return `${val} ${stats.currency || 'MAD'}`;
-    };
-
     let body = `📊 *Financial Summary:* ${stats.month}\n` +
                `━━━━━━━━━━━━━━━━━━\n\n` +
                `💶 *BUSINESS PERFORMANCE*\n` +
                `* Total Income:   ${fmt(income)}\n` +
-               `* Total Expenses: ${fmt(expenses)}\n` +
+               `* Total Expenses: ${fmt(expensesTotal)}\n` +
                `━━━━━━━━━━━━━━━━━━\n` +
                `🏦 *NET BALANCE:  ${fmt(balance)}*\n\n` +
                `📋 *TAX & VAT ESTIMATE*\n` +
                `* VAT Payable:    ${fmt(vat)}\n\n` +
                `📈 *BOOKKEEPING PROGRESS*\n` +
-               `* Status: ${statusIcon} ${statusText}\n` +
-               `* Invoices recorded: ${stats.invoicesCount}\n` +
-               `* Expenses recorded: ${stats.expensesCount}\n` +
-               `* Bank Statements:  ${stats.statementsCount}\n\n` +
+               `* Status: ${statusIcon} ${statusText}\n\n` +
+               detailText +
                `${missingText}\n\n` +
                `━━━━━━━━━━━━━━━━━━\n` +
                `Select an action below to manage your records:`;
@@ -1474,136 +1658,226 @@ ${downloadUrl}`;
    * Entry point for natural language reporting
    */
   async handleReportQuery(from, text) {
-      const filters = await aiService.parseReportQuery(text, from);
+    const filters = await aiService.parseReportQuery(text, from);
+    
+    // Safety Net: If AI incorrectly matched a month as an entity name
+    const months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+    if (filters.entityName && months.includes(filters.entityName.toLowerCase())) {
+      const mIdx = months.indexOf(filters.entityName.toLowerCase()) + 1;
+      filters.month = mIdx;
+      filters.entityName = null;
+    }
+
+    if (!filters.entityName) {
+      // General status report
+      await whatsappService.sendTextMessage(from, "Retrieving your account status summary...");
+      const stats = await laravelService.getAccountStatus(from, filters.month, filters.year);
+      const monthsLabel = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+      let periodStr = filters.month ? `${monthsLabel[filters.month-1]} ` : "";
+      periodStr += filters.year || (filters.month ? "" : "this month");
       
-      if (!filters.entityName) {
-          // General status report
-          const stats = await laravelService.getAccountStatus(from, filters.month, filters.year);
-          const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-          let periodStr = filters.month ? `${months[filters.month-1]} ` : "";
-          periodStr += filters.year || (filters.month ? "" : "this month");
-          
-          
-          return this.sendStatusInteractive(from, stats);
-      }
+      return this.sendStatusInteractive(from, stats);
+    }
 
-      // Search for entity
-      await whatsappService.sendTextMessage(from, `🔍 Searching for reports on "*${filters.entityName}*"...`);
-      
-      const [clients, suppliers] = await Promise.all([
-          laravelService.getClients(from),
-          laravelService.getSuppliers(from)
-      ]);
+    // Search for entity
+    await whatsappService.sendTextMessage(from, `🔍 Searching for reports on "*${filters.entityName}*"...`);
+    
+    const [clients, suppliers] = await Promise.all([
+      laravelService.getClients(from),
+      laravelService.getSuppliers(from)
+    ]);
 
-      // Sanitize search: remove trailing punctuation and trim
-      const search = filters.entityName.toLowerCase().replace(/[.,!?;:]+$/, "").trim();
-      const matchedClients = (clients || []).filter(c => c.client_name.toLowerCase().includes(search));
-      const matchedSuppliers = (suppliers || []).filter(s => s.name.toLowerCase().includes(search));
+    // Sanitize search: remove trailing punctuation and trim
+    const search = filters.entityName.toLowerCase().replace(/[.,!?;:]+$/, "").trim();
+    const matchedClients = (clients || []).filter(c => c.client_name.toLowerCase().includes(search));
+    const matchedSuppliers = (suppliers || []).filter(s => s.name.toLowerCase().includes(search));
 
-      const totalMatches = matchedClients.length + matchedSuppliers.length;
+    const totalMatches = matchedClients.length + matchedSuppliers.length;
 
-      if (totalMatches === 0) {
-          await whatsappService.sendTextMessage(from, `❌ I couldn't find any Client or Supplier matching "*${filters.entityName}*".\n\nPlease try again with a different name.`);
-          return;
-      }
+    if (totalMatches === 0) {
+      await whatsappService.sendTextMessage(from, `❌ I couldn't find any Client or Supplier matching "*${filters.entityName}*".\n\nPlease try again with a different name.`);
+      return;
+    }
 
-      if (totalMatches === 1) {
-          const entity = matchedClients[0] || matchedSuppliers[0];
-          const isClient = !!matchedClients[0];
-          return this.sendFilteredReport(from, entity, isClient, filters);
-      }
+    if (totalMatches === 1) {
+      const entity = matchedClients[0] || matchedSuppliers[0];
+      const isClient = !!matchedClients[0];
+      return this.sendFilteredReport(from, entity, isClient, filters);
+    }
 
-      // DISAMBIGUATION: Multiple matches found
-      const combined = [
-          ...matchedClients.map(c => ({ id: `rep_c_${c.id}`, title: `Client: ${c.client_name.substring(0,12)}` })),
-          ...matchedSuppliers.map(s => ({ id: `rep_s_${s.id}`, title: `Supp: ${s.name.substring(0,13)}` }))
-      ].slice(0, 3); // Max 3 buttons
+    // DISAMBIGUATION: Multiple matches found
+    const combined = [
+      ...matchedClients.map(c => ({ id: `rep_c_${c.id}`, title: `Client: ${c.client_name.substring(0,12)}` })),
+      ...matchedSuppliers.map(s => ({ id: `rep_s_${s.id}`, title: `Supp: ${s.name.substring(0,13)}` }))
+    ].slice(0, 3); // Max 3 buttons
 
-      await whatsappService.sendInteractiveButtons(from, 
-          `🤔 I found multiple matches for "*${filters.entityName}*". Which one did you mean?`,
-          combined
-      );
-      
-      // Save filter context in state so we can pick it up when they click a button
-      stateService.setUserState(from, 'AWAITING_REPORT_DISAMBIGUATION', { filters });
+    await whatsappService.sendInteractiveButtons(from, 
+      `🤔 I found multiple matches for "*${filters.entityName}*". Which one did you mean?`,
+      combined
+    );
+    
+    // Save filter context in state so we can pick it up when they click a button
+    stateService.setUserState(from, 'AWAITING_REPORT_DISAMBIGUATION', { filters });
   }
 
   /**
    * Resolves disambiguation click
    */
   async handleReportDisambiguation(from, interactiveId, state) {
-      const parts = interactiveId.split('_');
-      if (parts.length < 3) return;
+    const parts = interactiveId.split('_');
+    if (parts.length < 3) return;
 
-      const isClient = parts[1] === 'c';
-      const entityId = parts[2];
-      
-      // Perform the lookup once and store in state
-      const entities = isClient ? await laravelService.getClients(from) : await laravelService.getSuppliers(from);
-      const entity = entities ? entities.find(e => e.id == entityId) : null;
+    const isClient = parts[1] === 'c';
+    const entityId = parts[2];
+    
+    // Perform the lookup once and store in state
+    const entities = isClient ? await laravelService.getClients(from) : await laravelService.getSuppliers(from);
+    const entity = entities ? entities.find(e => e.id == entityId) : null;
 
-      if (!entity) {
-          await whatsappService.sendTextMessage(from, "❌ Sorry, I couldn't find that record. Please try searching for them again.");
-          stateService.clearUserState(from);
-          return;
-      }
+    if (!entity) {
+      await whatsappService.sendTextMessage(from, "❌ Sorry, I couldn't find that record. Please try searching for them again.");
+      stateService.clearUserState(from);
+      return;
+    }
 
-      if (state.data.filters && (state.data.filters.month || state.data.filters.year)) {
-          await this.sendFilteredReport(from, entity, isClient, state.data.filters);
-          stateService.clearUserState(from);
-      } else {
-          // Store the full entity so AWAITING_REPORT_PERIOD can use it directly
-          stateService.setUserState(from, 'AWAITING_REPORT_PERIOD', { entityId, isClient, entity });
-          await this.sendReportPeriodButtons(from);
-      }
+    if (state.data.filters && (state.data.filters.month || state.data.filters.year)) {
+      await this.sendFilteredReport(from, entity, isClient, state.data.filters);
+      stateService.clearUserState(from);
+    } else {
+      // Store the full entity so AWAITING_REPORT_PERIOD can use it directly
+      stateService.setUserState(from, 'AWAITING_REPORT_PERIOD', { entityId, isClient, entity });
+      await this.sendReportPeriodButtons(from);
+    }
   }
 
   /**
    * Formats and sends the actual report
    */
   async sendFilteredReport(from, entity, isClient, filters) {
-      const queryParams = {
-          month: filters.month,
-          year: filters.year
-      };
-      if (isClient) queryParams.client_id = entity.id;
-      else queryParams.supplier_id = entity.id;
+    const queryParams = {
+      month: filters.month,
+      year: filters.year
+    };
+    if (isClient) queryParams.client_id = entity.id;
+    else queryParams.supplier_id = entity.id;
 
-      const stats = await laravelService.getAccountStatus(from, queryParams.month, queryParams.year, queryParams.client_id, queryParams.supplier_id);
-      
-      if (!stats) {
-          return whatsappService.sendTextMessage(from, "❌ I'm sorry, I couldn't retrieve the report data at this moment. Please try again later.");
-      }
-      
-      const name = isClient ? entity.client_name : entity.name;
-      const icon = isClient ? '👤' : '🚚';
-      const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-      
-      let periodStr = 'All Time';
-      if (filters.month || filters.year) {
-          periodStr = (filters.month ? `${months[filters.month-1]} ` : "") + (filters.year || "");
-      }
+    const stats = await laravelService.getAccountStatus(from, queryParams.month, queryParams.year, queryParams.client_id, queryParams.supplier_id);
+    
+    if (!stats) {
+      return whatsappService.sendTextMessage(from, "❌ I'm sorry, I couldn't retrieve the report data at this moment. Please try again later.");
+    }
+    
+    const name = isClient ? entity.client_name : entity.name;
+    const icon = isClient ? '👤' : '🚚';
+    const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    
+    let periodStr = 'All Time';
+    if (filters.month || filters.year) {
+      periodStr = (filters.month ? `${months[filters.month-1]} ` : "") + (filters.year || "");
+    }
 
-      let report = `${icon} *Report for ${name}*\n`;
-      if (periodStr) report += `📅 *Period:* ${periodStr}\n`;
-      report += `--- \n\n`;
+    let report = `${icon} *Report for ${name}*\n`;
+    if (periodStr) report += `📅 *Period:* ${periodStr}\n`;
+    report += `--- \n\n`;
 
-      if (isClient) {
-          // --- CLIENT VIEW (SALES) ---
-          report += `💰 *Revenue:* ${(stats.salesSum || 0).toFixed(2)}\n`;
-          report += `🕒 *Outstanding:* ${(stats.total_unpaid_sum || 0).toFixed(2)}\n`;
-          report += `📈 *Quotes:* ${(stats.total_quote_sum || 0).toFixed(2)}\n`;
-          report += `🏛️ *VAT Collected:* ${(stats.cash_vat_sum || 0).toFixed(2)}\n`;
+    if (isClient) {
+      // --- CLIENT VIEW (SALES) ---
+      report += `💰 *Revenue:* ${(stats.salesSum || 0).toFixed(2)}\n`;
+      report += `🕒 *Outstanding:* ${(stats.total_unpaid_sum || 0).toFixed(2)}\n`;
+      report += `📈 *Quotes:* ${(stats.total_quote_sum || 0).toFixed(2)}\n`;
+      report += `🏛️ *VAT Collected:* ${(stats.cash_vat_sum || 0).toFixed(2)}\n`;
+    } else {
+      // --- SUPPLIER VIEW (PURCHASES) ---
+      report += `💸 *Total Expenses:* ${(stats.expensesSum || 0).toFixed(2)}\n`;
+      report += `🏷️ *VAT Paid:* ${(stats.expenseVat || 0).toFixed(2)}\n`;
+      report += `📋 *Records:* ${stats.expensesCount || 0} expenses\n`;
+    }
+
+    report += `\n_You can view the full transaction history for this filter in your portal._`;
+
+    const monthPad = filters.month ? String(filters.month).padStart(2, '0') : '00';
+    const yearPad = filters.year ? String(filters.year) : '0000';
+    const listAction = isClient ? 'list_inv' : 'list_exp';
+    const listButtonId = `${listAction}_${entity.id}_${monthPad}_${yearPad}`;
+    const listButtonTitle = isClient ? '📄 List Invoices' : '📄 List Expenses';
+
+    const recExpId = `record_exp_${entity.id}`;
+    const recInvId = `record_inv_${entity.id}`;
+
+    const buttons = [
+      { id: listButtonId, title: listButtonTitle },
+      { id: 'action_status', title: '📊 Status' }
+    ];
+
+    if (isClient) {
+      buttons.push({ id: recInvId, title: '✍️ Record Invoice' });
+    } else {
+      buttons.push({ id: recExpId, title: '✍️ Record Expense' });
+    }
+
+    await whatsappService.sendInteractiveButtons(from, report, buttons);
+  }
+
+  /**
+   * Drill-down handler for specific transaction lists
+   */
+  async handleListTransactions(from, type, entityId, month, year) {
+    try {
+      // 1. Fetch data
+      let transactions = [];
+      let title = "";
+
+      if (type === 'inv') {
+        transactions = await laravelService.getInvoices(from, null, month, year, entityId);
+        title = "📑 Recent Invoices";
       } else {
-          // --- SUPPLIER VIEW (PURCHASES) ---
-          report += `💸 *Total Expenses:* ${(stats.expensesSum || 0).toFixed(2)}\n`;
-          report += `🏷️ *VAT Paid:* ${(stats.expenseVat || 0).toFixed(2)}\n`;
-          report += `📋 *Records:* ${stats.expensesCount || 0} expenses\n`;
+        transactions = await laravelService.getExpenses(from, month, year, entityId);
+        title = "💸 Recent Expenses";
       }
 
-      report += `\n_You can view the full transaction history for this filter in your portal._`;
+      if (transactions.length === 0) {
+        return whatsappService.sendTextMessage(from, `ℹ️ No transactions found for this period.`);
+      }
 
-      await whatsappService.sendTextMessage(from, report);
+      // 2. Format list (Top 5)
+      const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+      const periodStr = month ? `${months[month-1]} ${year || ''}` : (year ? year : "All Time");
+      
+      let response = `*${title}*\n` +
+                     `📅 *Period:* ${periodStr}\n` +
+                     `━━━━━━━━━━━━━━━━━━\n\n`;
+
+      transactions.slice(0, 5).forEach((t, index) => {
+        const date = t.date ? new Date(t.date).toLocaleDateString('en-GB') : 'N/A';
+        
+        // Calculate amount logic (Unified for VAT and TTC)
+        let amount = 0;
+        if (type === 'inv') {
+          amount = (t.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0);
+        } else {
+          amount = parseFloat(t.total_ttc || t.ttc || 0);
+        }
+
+        const currency = t.currency || 'MAD';
+        const fmtAmount = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + currency;
+        
+        response += `${index + 1}. *${date}* — ${fmtAmount}\n`;
+        if (t.download_url) {
+          response += `🔗 [OPEN DOCUMENT](${t.download_url})\n`;
+        }
+        response += `\n`;
+      });
+
+      if (transactions.length > 5) {
+        response += `_Showing last 5 of ${transactions.length} records._\n`;
+      }
+
+      await whatsappService.sendTextMessage(from, response);
+
+    } catch (error) {
+      console.error('handleListTransactions error:', error);
+      await whatsappService.sendTextMessage(from, "❌ Sorry, I encountered an error while fetching the transaction list.");
+    }
   }
 }
 

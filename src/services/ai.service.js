@@ -27,7 +27,20 @@ class AIService {
    */
   async parseWithOpenAI(text, categories = [], phone = null, skipCooldown = false) {
     console.log('Using OpenAI for NLP extraction...');
-    const today = new Date().toISOString().split('T')[0];
+    const now = new Date();
+    // Generate a relative date reference for the last 7 days to eliminate AI math errors
+    const days = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(now);
+      d.setDate(now.getDate() - i);
+      const dayName = d.toLocaleString('en-US', { weekday: 'long' });
+      const dayDate = d.toISOString().split('T')[0];
+      days.push(`${dayName}: ${dayDate}`);
+    }
+    const relativeDaysRef = days.join(', ');
+    
+    const today = now.toISOString().split('T')[0] + ' (' + now.toLocaleString('en-US', { weekday: 'long' }) + ')';
+    const dateContext = `Today's Date: ${today}. Recent Date Reference (Day: YYYY-MM-DD): [${relativeDaysRef}].`;
     const catList = categories.length > 0 ? `Available Categories: [${categories.join(', ')}]. ` : '';
     const model = "gpt-4o-mini";
 
@@ -37,14 +50,17 @@ class AIService {
         messages: [
           { 
             role: "system", 
-            content: `You are an accounting assistant. Today's Date is ${today}. Extract details from the user's message. ` + 
+            content: `You are an accounting assistant. ${dateContext} Extract details from the user's message. ` + 
                       catList +
-                      "Try to match with 'Available Categories'. If no match, suggest a simple/logical new category. Do NOT use 'General' if a better inference exists. " +
+                      "PRIORITY 1: Match exactly or semantically with 'Available Categories' (e.g., if 'Food' is available, map 'Coffee'/'Cafe' to it). " +
+                      "PRIORITY 2: If no match in your list, use COMMON MAPPINGS: 'Coffee', 'Lunch' -> 'Meals & Entertainment'. 'Taxi', 'Uber', 'Fuel' -> 'Travel & Transport'. 'Paper', 'Ink' -> 'Office Supplies'. " +
+                      "PRIORITY 3: If no match found anywhere else, suggest a simple/logical new category. " +
+                      "Do NOT create a NEW category if an existing one in 'Available Categories' is a reasonable match. Do NOT use 'General' or 'Other' if a better inference exists. " +
                       "Classify as 'EXPENSE' (receipt), 'STATEMENT' (bank summary), or 'INVOICE' (sales/income). " + 
                       "Extract the status of the document into 'status'. For invoices: ['Paid', 'Unpaid', 'Draft']. For expenses: ['Paid', 'Pending']. If the user does NOT explicitly mention the status (like 'paid' or 'draft'), you MUST return null for 'status'. Do NOT guess. " +
-                      "Extract the Supplier (for expenses) or Client (for invoices) name into 'entity'. " +
+                      "Extract the Supplier (for expenses) or Client (for invoices) name into 'entity'. Confidently extract the location or business name after prepositions like 'at', 'to', or 'from' (e.g., 'at the museum' -> 'Museum', 'paid to Amazon' -> 'Amazon'). " +
+                      "CRITICAL: Only return 'Unknown' if there is absolutely no mention of a place or person. If a location is mentioned, use it. " +
                       "IMPORTANT: If the message starts with a command verb like 'Bill', 'Invoice', or 'Record' (e.g., 'Bill 100 to...'), do NOT take the word 'Bill' or 'Invoice' as the client name. " +
-                      "CRITICAL: If you are unsure of the entity name or it is a command, return 'Unknown' for 'entity'. " + 
                       "PAYMENT METHODS: Strictly identify and map to one of: ['Cash', 'Bank Transfer', 'Credit/Debit Card', 'Cheque', 'Mobile Payment', 'Online Payment', 'Direct Debit', 'Deferred Payment', 'Instant Bank Transfer', 'PayPal', 'Other']. " +
                       "IMPORTANT: If the payment method is NOT mentioned in the text or visible on the receipt, return `null` for 'payment_method'. Do NOT guess 'Other' or 'WhatsApp'. " +
                       "IMPORTANT: For the 'date' field, only return a date if clearly mentioned or identifiable. If not found, return `null`. " +
@@ -124,10 +140,10 @@ class AIService {
     let category = documentType === 'INVOICE' ? 'Sales' : (documentType === 'STATEMENT' ? 'Banking' : 'General');
     let entity = 'General';
     
-    const catKeywords = ['food', 'rest', 'dinner', 'lunch', 'breakfast', 'fuel', 'petrol', 'taxi', 'uber', 'travel', 'parking', 'supplies', 'legal', 'mkt', 'adv'];
+    const catKeywords = ['food', 'rest', 'dinner', 'lunch', 'breakfast', 'coffee', 'cafe', 'fuel', 'petrol', 'taxi', 'uber', 'travel', 'parking', 'supplies', 'legal', 'mkt', 'adv'];
     for (const k of catKeywords) {
       if (textLower.includes(k)) { 
-        if (['food', 'rest', 'dinner', 'lunch', 'breakfast'].includes(k)) category = 'Food & Dining';
+        if (['food', 'rest', 'dinner', 'lunch', 'breakfast', 'coffee', 'cafe'].includes(k)) category = 'Food & Dining';
         else if (['fuel', 'petrol', 'taxi', 'uber', 'travel', 'parking'].includes(k)) category = 'Travel & Transport';
         else if (['supplies'].includes(k)) category = 'Office Supplies';
         else category = k.charAt(0).toUpperCase() + k.slice(1); 
@@ -135,12 +151,18 @@ class AIService {
       }
     }
 
-    const entKeywords = ['starbucks', 'shell', 'uber', 'amazon', 'google', 'digitalocean', 'paypal', 'apple', 'microsoft', 'restaurant', 'cafe', 'bar'];
+    const entKeywords = ['starbucks', 'shell', 'uber', 'amazon', 'google', 'digitalocean', 'paypal', 'apple', 'microsoft', 'restaurant', 'cafe', 'bar', 'museum', 'zomato', 'swiggy', 'ubereats', 'deliveroo', 'glovo'];
     for (const k of entKeywords) {
       if (textLower.includes(k)) { 
         entity = k.charAt(0).toUpperCase() + k.slice(1); 
         break; 
       }
+    }
+
+    // Extraction patterns (e.g., "at the museum", "to Amazon")
+    const entMatch = text.match(/(?:at|to|from)\s+(?:the\s+)?([a-z0-9\s]+?)(?:\s+for|\s+on|\s+paid|$)/i);
+    if (entMatch && entity === 'General') {
+      entity = entMatch[1].split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
     }
 
     // Extract Month/Year for Statements (e.g. "April 2026" or "04/2026")
@@ -464,11 +486,16 @@ class AIService {
             Current Date: ${new Date().toISOString().split('T')[0]}
 
             RULES:
-            1. If they mention a month (e.g. "March", "last month"), extract the month number (1-12).
-            2. If they mention a year (e.g. "2025", "next year"), extract the year (YYYY).
-            3. If they mention a name of a person or company (e.g. "Amazon", "Client X"), extract it as 'entityName'.
-            4. If no specific name is mentioned, return null for 'entityName'.
-            5. Determine if they are asking for 'expenses', 'invoices' (sales/income), or a 'general' summary.
+            1. DATE EXTRACTION (PRIORITY): If they mention a month (e.g. "March", "last month"), extract the month number (1-12). If they mention a year (e.g. "2026"), extract it.
+            2. NEGATIVE CONSTRAINT: Month names (January-December) and Years (2025-2030) are NEVER entities. If you see "report for march", 'entityName' MUST be null.
+            3. ENTITY EXTRACTION: If they mention a company, store, or person (e.g. "Amazon", "Restaurant"), extract it as 'entityName'. 
+            4. DATATYPE: Determine if they are asking for 'expenses', 'invoices' (sales/income), or a 'general' summary.
+
+            EXAMPLES:
+            - "report for march" -> {"entityName": null, "month": 3, "year": null, "dataType": "general"}
+            - "report for nitesh arya march" -> {"entityName": "Nitesh Arya", "month": 3, "year": null, "dataType": "general"}
+            - "expenses for amazon" -> {"entityName": "Amazon", "month": null, "year": null, "dataType": "expenses"}
+            - "status of restaurant" -> {"entityName": "Restaurant", "month": null, "year": null, "dataType": "general"}
 
             RETURN JSON ONLY:
             {
