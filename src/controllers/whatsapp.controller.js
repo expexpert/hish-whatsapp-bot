@@ -1989,7 +1989,7 @@ class WhatsAppController {
       report += `🏛️ *${t('field_vat_collected', state.lang)}:* ${(stats.cash_vat_sum || 0).toFixed(2)}\n`;
     } else {
       // --- SUPPLIER VIEW (PURCHASES) ---
-      report += `💸 *${t('field_revenue', state.lang)}:* ${(stats.expensesSum || 0).toFixed(2)}\n`;
+      report += `💸 *${t('report_expenses', state.lang)}:* ${(stats.expensesSum || 0).toFixed(2)}\n`;
       report += `🏷️ *${t('field_vat_paid', state.lang)}:* ${(stats.expenseVat || 0).toFixed(2)}\n`;
       report += `📋 *${t('field_records', state.lang)}:* ${stats.expensesCount || 0}\n`;
     }
