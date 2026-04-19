@@ -18,5 +18,6 @@ module.exports = {
   botSecret: process.env.WHATSAPP_BOT_SECRET,
   bypassAuth: process.env.BOT_AUTH_BYPASS === 'true',
   skipAiLimits: process.env.SKIP_AI_LIMITS === 'true',
-  storageDir: process.env.STORAGE_DIR || '/tmp/whatsapp-bot-storage'
+  storageDir: process.env.STORAGE_DIR || '/tmp/whatsapp-bot-storage',
+  debug: process.env.DEBUG === 'true'
 };

@@ -1,5 +1,7 @@
 const config = require('../config');
 const whatsappService = require('../services/whatsapp.service');
+const logger = require('../utils/logger');
+
 
 class BotController {
   /**
@@ -19,8 +21,6 @@ class BotController {
       if (!phone || !otp) {
         return res.status(400).json({ status: 'error', message: 'Phone and OTP are required' });
       }
-
-      console.log(`🔐 Triggering Auth OTP for ${phone}: ${otp}`);
 
       // We use the 'auth_otp' template. 
       // Meta Auth templates usually have one parameter in the body: the code.
@@ -48,7 +48,7 @@ class BotController {
 
       return res.json({ status: 'success', message: 'OTP sent successfully' });
     } catch (error) {
-      console.error('Bot Controller Error:', error.message);
+      logger.error('Bot Controller Error', error);
       return res.status(500).json({ status: 'error', message: error.message });
     }
   }

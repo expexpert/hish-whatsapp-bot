@@ -6,6 +6,9 @@ const laravelService = require('../services/laravel.service');
 const stateService = require('../services/state.service');
 const config = require('../config');
 const fs = require('fs');
+const { t } = require('../utils/i18n');
+const logger = require('../utils/logger');
+
 
 class WhatsAppController {
   constructor() {
@@ -13,19 +16,6 @@ class WhatsAppController {
     this.userQueues = new Map(); // Per-user message queue
     // Periodically clear old IDs to prevent memory leak
     setInterval(() => this.processedMessageIds.clear(), 3600000); // Every hour
-  }
-
-  // Persistent Debug Logger
-  logDebug(message, data = null) {
-      const timestamp = new Date().toISOString();
-      let logLine = `[${timestamp}] ${message}\n`;
-      if (data) logLine += `DATA: ${JSON.stringify(data, null, 2)}\n`;
-      logLine += `-------------------------------------------\n`;
-      try {
-          fs.appendFileSync(path.join(process.cwd(), 'debug_trace.log'), logLine);
-      } catch (err) {
-          console.error('Failed to write to debug_trace.log', err);
-      }
   }
   
   async verifyWebhook(req, res) {
@@ -45,8 +35,8 @@ class WhatsAppController {
 
   async handleWebhookEvent(req, res) {
     const body = req.body;
-    console.log('📬 NEW WEBHOOK EVENT RECEIVED');
-    console.log('📦 BODY:', JSON.stringify(body, null, 2));
+    logger.debug('📬 NEW WEBHOOK EVENT RECEIVED', body);
+
 
     if (body.object === 'whatsapp_business_account' && body.entry) {
       // 1. Respond 200 OK immediately to stop Meta from retrying
@@ -60,7 +50,6 @@ class WhatsAppController {
             for (const message of value.messages) {
               // 3. Deduplication
               if (this.processedMessageIds.has(message.id)) {
-                console.log(`⚠️ ALREADY PROCESSED MESSAGE: ${message.id}`);
                 continue;
               }
               this.processedMessageIds.add(message.id);
@@ -100,7 +89,8 @@ class WhatsAppController {
   async processMessage(message) {
     try {
       const from = message.from;
-      console.log(`🔍 [DEBUG] Incoming message from: "${from}"`);
+      logger.debug(`📥 Incoming message from: "${from}"`);
+
 
       // 0. Global Activation Check
       let isAuth = config.bypassAuth === true;
@@ -132,11 +122,8 @@ class WhatsAppController {
           const cooldown = 15 * 60 * 1000; // 15 minutes
 
           if (now - (state.lastWarned || 0) > cooldown) {
-              console.log(`📢 Sending activation warning to ${from} (Cooldown passed)`);
-              await whatsappService.sendTextMessage(from, "🛑 *Activation Required*\n\nYour WhatsApp bot is not yet linked to your accounting dashboard.\n\nTo activate:\n1. Log in to your web portal.\n2. Go to *Settings > WhatsApp Bot*.\n3. Click *Activate Bot*.\n\nOnce activated, you can start recording expenses and invoices here!");
+              await whatsappService.sendTextMessage(from, t('auth_required', state.lang));
               stateService.setLastWarned(from, now);
-          } else {
-              console.log(`🔇 Skipping activation warning for ${from} (Cooldown active)`);
           }
           return;
       }
@@ -157,7 +144,8 @@ class WhatsAppController {
           
           if (transcription) {
             text = transcription.trim();
-            console.log(`🎙️ AUDIO TRANSCRIPTION: "${text}"`);
+            logger.debug(`🎙️ AUDIO TRANSCRIPTION: "${text}"`);
+
             
             // Link the audio file as proof if we are in the middle of a task
             if (state.state !== 'IDLE') {
@@ -188,24 +176,46 @@ class WhatsAppController {
 
         const textLower = text.toLowerCase();
         const isInteractive = type === 'interactive';
+        if (!interactiveId && isInteractive && message.interactive) {
+          interactiveId = message.interactive.button_reply?.id || message.interactive.list_reply?.id;
+        }
+
+        const isConfirm = interactiveId === 'confirm' || 
+                         ['confirm', 'confirmer', 'ok', 'yes', 'oui', 'save', 'enregistrer'].includes(textLower);
+        const isEdit = interactiveId === 'edit' || 
+                      ['edit', 'modifier', 'change', 'corriger'].includes(textLower);
+        const isCancel = interactiveId === 'cancel' || 
+                        ['cancel', 'annuler', 'stop', 'quitter', 'menu'].includes(textLower);
         
         // --- GLOBAL INTENT INTERCEPTOR (Allows switching at ANY time) ---
         const primaryIntents = {
-            'status': { keywords: ['status', 'dashboard', 'summary'], id: 'status' },
-            'expense': { keywords: ['expense', 'record expense', 'new expense', 'add expense', 'record voice', 'audio note'], id: 'record_expense' },
-            'invoice': { keywords: ['invoice', 'record invoice', 'new invoice', 'add invoice'], id: 'record_invoice' },
-            'statement': { keywords: ['statement', 'upload statement', 'bank statement'], id: 'upload_statement' },
-            'reports_menu': { keywords: ['reports', 'quick reports'], id: 'quick_reports' },
-            'report': { keywords: ['report', 'how much', 'total', 'summary', 'show me'], id: 'report' },
-            'accountant': { keywords: ['ask accountant', 'contact accountant', 'talk to accountant'], id: 'ask_accountant' },
-            'menu': { keywords: ['menu', 'start', 'home', 'main menu', 'exit', 'cancel', 'stop', 'quit'], id: 'menu' }
+            'status': { keywords: ['status', 'dashboard', 'balance', 'statut', 'solde', 'tableau', 'compte'], id: 'status' },
+            'expense': { keywords: ['expense', 'record expense', 'new expense', 'add expense', 'record voice', 'audio note', 'paid', 'spent', 'receipt', 'purchase', 'dépense', 'payé', 'achat', 'reçu'], id: 'record_expense' },
+            'invoice': { keywords: ['invoice', 'record invoice', 'new invoice', 'add invoice', 'bill', 'client', 'sale', 'sold', 'facture', 'vente'], id: 'record_invoice' },
+            'statement': { keywords: ['statement', 'upload statement', 'bank statement', 'upload', 'pdf', 'relevé', 'banque', 'télécharger'], id: 'upload_statement' },
+            'reports_menu': { keywords: ['reports', 'quick reports', 'rapports'], id: 'quick_reports' },
+            'report': { keywords: ['report', 'how much', 'total', 'summary', 'show me', 'rapport', 'résumé', 'combien', 'période', 'mars', 'avril', 'janvier', 'janv', 'mars', 'déc'], id: 'report' },
+            'accountant': { keywords: ['ask accountant', 'contact accountant', 'talk to accountant', 'comptable'], id: 'ask_accountant' },
+            'menu': { keywords: ['menu', 'start', 'home', 'main menu', 'exit', 'cancel', 'stop', 'quit', 'bonjour', 'salut', 'coucou', 'début', 'annuler'], id: 'menu' }
         };
 
         let detectedIntent = null;
         const isShortMessage = text.split(' ').length <= 2;
 
-        // Force priority for exact menu button interactions to avoid NLP regex conflicts
-        if (interactiveId === 'quick_reports') {
+        // --- PRIORITY PROTECTION FOR FRENCH FLOW ---
+        // Prevents "Modifier" (Edit) or "Confirmer" from being misclassified 
+        // by AI as a "New Expense/Invoice" intent, which would clear the state.
+        const isCoreFrenchAction = state.lang === 'fr' && (isEdit || isConfirm || isCancel);
+        
+        if (textLower.startsWith('how much') || textLower.startsWith('combien') || textLower.startsWith('rapport') || 
+            textLower.includes('summary') || textLower.includes('résumé') || 
+            ((textLower.includes('statement') || textLower.includes('relevé')) && (textLower.includes('for') || textLower.includes('pour') || textLower.includes('from') || textLower.includes('de')))) {
+            detectedIntent = 'report';
+        } else if (isCoreFrenchAction && state.state !== 'IDLE') {
+            detectedIntent = null; // Prioritize local state handling over global intent interceptor
+            logger.debug(`🛡️ FRENCH CORE ACTION DETECTED (${text}): Bypassing global intent detection.`);
+        } else if (interactiveId === 'quick_reports') {
+            // Force priority for exact menu button interactions to avoid NLP regex conflicts
             detectedIntent = 'reports_menu';
         } else {
             for (const [intent, config] of Object.entries(primaryIntents)) {
@@ -224,19 +234,30 @@ class WhatsAppController {
             }
         }
 
-        // --- NEW: AI INTENT SENSING FOR UNHANDLED TEXT ---
-        if (!detectedIntent && (type === 'text' || type === 'audio') && state.state === 'IDLE') {
-            const greetings = ['hi', 'hello', 'hey', 'bonjour', 'salam', 'ola'];
+        // --- NEW: AI INTENT & LANGUAGE SENSING ---
+        // Triggered for natural language sentences to detect intent and language
+        if ((!detectedIntent || text.split(' ').length > 2) && !isCoreFrenchAction && (type === 'text' || type === 'audio') && state.state === 'IDLE') {
+            const greetings = ['hi', 'hello', 'hey', 'bonjour', 'salam', 'ola', 'ça va', 'ca va'];
             if (!greetings.includes(textLower)) {
-                const aiIntent = await aiService.classifyIntent(text, from, true);
-                if (aiIntent === 'UNKNOWN') {
-                    console.log(`🛑 UNRECOGNIZED TEXT DETECTED: "${text}"`);
-                    await whatsappService.sendTextMessage(from, "I'm sorry, I couldn't understand that request. Could you please specify if you want to record an expense, invoice, or check your status?");
-                    await this.sendWelcomeMenu(from);
-                    return;
-                } else if (aiIntent !== 'MENU') {
-                    detectedIntent = aiIntent.toLowerCase();
-                    console.log(`🤖 AI SENSING OVERRIDE: -> ${detectedIntent}`);
+                // Returns { intent, lang }
+                const aiResult = await aiService.classifyIntent(text, from, true);
+                
+                // --- UPDATE LANGUAGE ---
+                if (aiResult.lang && aiResult.lang !== state.lang) {
+                    stateService.setLanguage(from, aiResult.lang);
+                    state.lang = aiResult.lang; // Update local reference
+                }
+
+                // If keywords didn't find anything, let AI set the intent
+                if (!detectedIntent && aiResult.intent && aiResult.intent !== 'UNKNOWN' && aiResult.intent !== 'MENU') {
+                    detectedIntent = aiResult.intent.toLowerCase();
+                    logger.debug(`🤖 AI SENSING OVERRIDE: -> ${detectedIntent}`);
+                }
+            } else {
+                // Greetings trigger welcome menu in current language
+                if (textLower === 'bonjour' || textLower === 'ça va' || textLower === 'ca va') {
+                    stateService.setLanguage(from, 'fr');
+                    state.lang = 'fr';
                 }
             }
         }
@@ -293,18 +314,19 @@ class WhatsAppController {
                 stateService.setUserState(from, 'AWAITING_EXPENSE_DATA', { 
                     expenseData: { entity: entityName, supplier_id: entityId } 
                 });
-                await whatsappService.sendTextMessage(from, `✍️ *Recording expense for ${entityName}*...\n\nPlease provide the details (e.g., '150.00 for office supplies') or upload a receipt photo.`);
+                await whatsappService.sendTextMessage(from, t('prompt_expense', state.lang, { entity: entityName }));
             } else {
                 stateService.setUserState(from, 'AWAITING_INVOICE_DATA', { 
                     invoiceData: { client_name: entityName, client_id: entityId } 
                 });
-                await whatsappService.sendTextMessage(from, `✍️ *Recording invoice for ${entityName}*...\n\nPlease provide the details (e.g., '500.00 for consulting services') or upload the document.`);
+                await whatsappService.sendTextMessage(from, t('prompt_invoice', state.lang, { entity: entityName }));
             }
             return;
         }
 
         if (detectedIntent) {
-            console.log(`🎯 DETECTED INTENT: ${detectedIntent} (Current State: ${state.state})`);
+            logger.debug(`🎯 DETECTED INTENT: ${detectedIntent} (Current State: ${state.state})`);
+
             
             // FIX: Prevent recursive prompting loops and allow direct data entry
             // If already in the flow OR if the message follows a data-like pattern (longer than 2 words),
@@ -316,7 +338,8 @@ class WhatsAppController {
             const isDirectData = (type === 'text' || type === 'audio') && text.split(' ').length > 2 && (detectedIntent === 'expense' || detectedIntent === 'invoice');
 
             if ((isReTrigger || isDirectData) && (type === 'text' || type === 'audio' || type === 'voice')) {
-                console.log(`♻️ RE-TRIGGER OR DIRECT DATA: Skipping intent reset to allow parsing logic to take over.`);
+                logger.debug(`♻️ RE-TRIGGER OR DIRECT DATA: Skipping intent reset to allow parsing logic to take over.`);
+
                 // We fall through to the parsing logic below
             } else {
                 // If switching to a new major task or triggering via button, clear the old state first
@@ -330,21 +353,21 @@ class WhatsAppController {
                         if (type === 'text' || type === 'audio') {
                             return this.handleReportQuery(from, text);
                         }
-                        await whatsappService.sendTextMessage(from, "Retrieving your account status summary...");
+                        await whatsappService.sendTextMessage(from, t('fetching_status', state.lang));
                         const stats = await laravelService.getAccountStatus(from);
                         await this.sendStatusInteractive(from, stats);
                         return;
                     case 'expense':
                         stateService.setUserState(from, 'AWAITING_EXPENSE_DATA');
-                        await whatsappService.sendTextMessage(from, "Please provide the expense details or upload a receipt photo/audio note.\nExample: '150.00 for office supplies'");
+                        await whatsappService.sendTextMessage(from, t('prompt_expense_general', state.lang));
                         return;
                     case 'invoice':
                         stateService.setUserState(from, 'AWAITING_INVOICE_DATA');
-                        await whatsappService.sendTextMessage(from, "Please provide the invoice details or upload the document (PDF/Image).\nExample: '500.00 invoice for ABC Consulting'");
+                        await whatsappService.sendTextMessage(from, t('prompt_invoice_general', state.lang));
                         return;
                     case 'statement':
                         stateService.setUserState(from, 'AWAITING_STATEMENT_DATA');
-                        await whatsappService.sendTextMessage(from, "Please upload your Bank Statement in PDF format.");
+                        await whatsappService.sendTextMessage(from, t('prompt_stmt_general', state.lang));
                         return;
                     case 'accountant':
                         await this.handleAccountantQuery(from);
@@ -358,32 +381,30 @@ class WhatsAppController {
                 }
             }
         } else if (state.state === 'IDLE' || text.split(' ').length > 2) {
-            // --- AI INTENT FALLBACK (Point #4) ---
-            // Only trigger if hard-coded match fails AND user is idle OR sending a sentence
-            const aiIntent = await aiService.classifyIntent(text, from, true);
+            // --- AI INTENT FALLBACK ---
+            const aiResult = await aiService.classifyIntent(text, from, true);
+            const aiIntent = aiResult.intent;
+
             if (aiIntent !== 'UNKNOWN' && aiIntent !== 'MENU') {
-                console.log(`🤖 AI SWITCH DETECTED: -> ${aiIntent}`);
+                // Check and update language if AI detected a switch
+                if (aiResult.lang && aiResult.lang !== state.lang) {
+                    stateService.setLanguage(from, aiResult.lang);
+                    state.lang = aiResult.lang;
+                }
+
+                const isMatchingFlow = (aiIntent === 'EXPENSE' && state.state.includes('EXPENSE')) ||
+                                       (aiIntent === 'INVOICE' && state.state.includes('INVOICE')) ||
+                                       (aiIntent === 'STATEMENT' && state.state.includes('STATEMENT'));
                 
-        // --- STATE PROTECTION: Do not clear if we are ALREADY in the same flow ---
-        const isMatchingFlow = (aiIntent === 'EXPENSE' && state.state.includes('EXPENSE')) ||
-                               (aiIntent === 'INVOICE' && state.state.includes('INVOICE')) ||
-                               (aiIntent === 'STATEMENT' && state.state.includes('STATEMENT'));
-        
-        if (!isMatchingFlow) {
-          stateService.clearUserState(from);
-        } else {
-          console.log(`🛡️ Persisting current context: Detected ${aiIntent} intent matches active ${state.state} flow.`);
-        }
+                if (!isMatchingFlow) {
+                  stateService.clearUserState(from);
+                }
                 
                 if (aiIntent === 'STATUS') {
-                    console.log(`🤖 AI STATUS INTENT detected: routing to handleReportQuery`);
                     return this.handleReportQuery(from, text);
-                } else if (aiIntent === 'EXPENSE') {
-                    console.log(`🤖 AI SWITCH DETECTED: -> EXPENSE (Data provided in sentence)`);
-                    // Fall through to parsing logic below
-                } else if (aiIntent === 'INVOICE') {
-                    console.log(`🤖 AI SWITCH DETECTED: -> INVOICE (Data provided in sentence)`);
-                    // Fall through to parsing logic below
+                } else if (aiIntent === 'EXPENSE' || aiIntent === 'INVOICE') {
+                    // These will be handled by the direct data entry parser below
+                    // Just let them continue, but ensure we don't fall through to menu
                 } else if (aiIntent === 'ACCOUNTANT') {
                     await this.handleAccountantQuery(from);
                     return;
@@ -404,52 +425,54 @@ class WhatsAppController {
 
         // Check for Confirmation/Edit state
         if (state.state === 'AWAITING_EXPENSE_CONFIRMATION') {
-          if (textLower === 'confirm') {
+          if (isConfirm) {
             const result = await laravelService.createExpense(state.data.expenseData, state.data.receiptPath, from);
-            let feedback = "*Record Saved Successfully*";
+            let feedback = t('record_saved_success', state.lang);
             
             if (state.data.receiptPath) {
               const fileName = path.basename(state.data.receiptPath);
               const isAudio = fileName.endsWith('.ogg');
               
               if (!isAudio) {
-                feedback += "\nYour document has been synchronized with the portal.";
+                feedback += "\n" + t('sync_success_msg', state.lang);
                 
                 // Use signed URL if available, else fallback safely
                 if (result.data && (result.data.download_url || result.data.id)) {
                   const downloadUrl = result.data.download_url || `${laravelService.publicUrl}/api/bot/file/${result.data.id}`;
+                  logger.debug('🔗 GENERATED DOWNLOAD URL', { downloadUrl });
+                  logger.debug(`💸 [INFO] Delivering Expense Receipt: ${downloadUrl}`);
                   
                   if (downloadUrl.includes('localhost') || downloadUrl.includes('127.0.0.1')) {
-                    console.warn(`⚠️ [WARNING] Sending localhost URL to Meta (Expense): ${downloadUrl}`);
                   }
-                  console.log(`💸 [INFO] Delivering Expense Receipt: ${downloadUrl}`);
 
-                  feedback += `\n\n---
-📥 *OPEN RECEIPT*
-${downloadUrl}`;
+                  feedback += `\n\n---\n📥 *${t('open_receipt', state.lang).toUpperCase()}*\n${downloadUrl}`;
                   
                   // Also send as a proper Document Attachment for better UX
-                  await whatsappService.sendDocument(from, downloadUrl, `Receipt_${result.data.id || 'Draft'}.pdf`);
+                  const extension = result.data.document_path ? path.extname(result.data.document_path) : '.pdf';
+                  const filename = `Receipt_${result.data.id || 'Draft'}${extension}`;
+                  await whatsappService.sendDocument(from, downloadUrl, filename);
                 } else {
                   let finalUrl = result.file_url || `${config.botPublicUrl}/storage/${fileName}`;
-                  feedback += `\n\n---
-📸 *VIEW ATTACHMENT*
-${finalUrl}`;
+                  feedback += `\n\n---\n📸 *${t('image_attached', state.lang).toUpperCase()}*\n${finalUrl}`;
                 }
               } else {
-                feedback += "\nYour voice note has been processed and saved.";
+                feedback += "\n" + t('voice_processed_msg', state.lang);
               }
             } else {
-              feedback += "\nYour accountant has been notified. You may provide a receipt at a later time.";
+              feedback += "\n" + t('accountant_notified_msg', state.lang);
             }
             
             await whatsappService.sendTextMessage(from, feedback);
             stateService.clearUserState(from);
-          } else if (textLower === 'edit') {
+          } else if (isEdit) {
             stateService.setUserState(from, 'AWAITING_EDIT_SELECT', state.data);
             await this.sendEditSelectionButtons(from);
+          } else if (isCancel) {
+            stateService.clearUserState(from);
+            await whatsappService.sendTextMessage(from, t('cancel_msg', state.lang));
+            await this.sendWelcomeMenu(from);
           } else {
-            await whatsappService.sendTextMessage(from, "Please select 'Confirm' to save this record or 'Edit' to make changes.\n\nNote: You may also upload a photo now to link it as a receipt.");
+            await whatsappService.sendTextMessage(from, t('prompt_confirm_link', state.lang));
           }
           return;
         }
@@ -460,12 +483,11 @@ ${finalUrl}`;
 
         if (state.state === 'AWAITING_REPORT_PERIOD' && (isInteractive || !detectedIntent)) {
             const period = interactiveId || textLower;
-            console.log(`⏳ Processing Report Period: "${period}" for Client/Supp ID: ${state.data?.entityId}`);
             
             // Handle Custom Search Transition
             if (period === 'rep_period_custom') {
                 stateService.setUserState(from, 'AWAITING_REPORT_CUSTOM_PERIOD', state.data);
-                return whatsappService.sendTextMessage(from, "Sure! Please type the *Month and Year* you want to see (e.g., 'March 2024' or 'Jan 23').");
+                return whatsappService.sendTextMessage(from, t('prompt_report_period', state.lang));
             }
 
             let month = null;
@@ -490,7 +512,7 @@ ${finalUrl}`;
                 await this.sendFilteredReport(from, entity, isClient, filters);
             } else {
                 stateService.clearUserState(from);
-                await whatsappService.sendTextMessage(from, "❌ I'm sorry, I lost track of who you selected. Please try searching again.");
+                await whatsappService.sendTextMessage(from, t('error_lost_track', state.lang));
             }
             return;
         }
@@ -506,7 +528,7 @@ ${finalUrl}`;
                 await this.sendFilteredReport(from, entity, isClient, filters);
                 stateService.clearUserState(from);
             } else {
-                await whatsappService.sendTextMessage(from, "I couldn't quite understand that date. Please try typing something like 'March 2024' or 'February'.\n\n_Type 'cancel' to stop._");
+                await whatsappService.sendTextMessage(from, t('error_invalid_date', state.lang));
             }
             return;
         }
@@ -520,39 +542,36 @@ ${finalUrl}`;
 
         // --- Handle Invoice Confirmation ---
         if (state.state === 'AWAITING_INVOICE_CONFIRMATION') {
-            if (textLower === 'confirm') {
-                this.logDebug('🚀 INVOICE CONFIRMATION START', { invoiceData: state.data.invoiceData });
+          if (isConfirm) {
+                logger.debug('🚀 INVOICE CONFIRMATION START', { invoiceData: state.data.invoiceData });
                 
                 const result = await laravelService.createInvoice(state.data.invoiceData, state.data.filePath, from);
-                this.logDebug('🧾 LARAVEL RESPONSE RECEIVED', result);
+                logger.debug('🧾 LARAVEL RESPONSE RECEIVED', result);
                 
                 // Laravel returns the signed URL in 'download_url'
                 if (result.data && (result.data.download_url || result.data.pdf_url || result.data.id)) {
                     let downloadUrl = result.data.download_url || result.data.pdf_url || `${laravelService.publicUrl}/api/bot/invoice/pdf/${result.data.id}`;
                     
-                    this.logDebug('🔗 GENERATED DOWNLOAD URL', { downloadUrl });
-
                     // Defensive: Ensure we are not sending a localhost URL to Meta
                     if (downloadUrl.includes('localhost') || downloadUrl.includes('127.0.0.1')) {
-                        this.logDebug('⚠️ WARNING: Localhost URL detected');
                     }
                     
                     // 1. Deliver the document with a rich Professional Caption
                     try {
-                        const date = result.data.date ? new Date(result.data.date).toLocaleDateString('en-GB') : 'N/A';
+                        const date = result.data.date ? new Date(result.data.date).toLocaleDateString(state.lang === 'fr' ? 'fr-FR' : 'en-GB') : 'N/A';
                         const amount = parseFloat(result.data.total_ttc || result.data.amount || 0);
                         const currency = result.data.currency || 'MAD';
-                        const fmtAmount = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + currency;
+                        const fmtAmount = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + currency;
                         const entityName = result.data.client_name || result.data.entity || 'N/A';
 
-                        const successText = `🧾 *INVOICE RECORDED*\n` +
+                        const successText = `🧾 *${t('invoice_recorded_header', state.lang)}*\n` +
                                             `━━━━━━━━━━━━━━━━━━\n` +
-                                            `🏢 *Client:* ${entityName}\n` +
-                                            `💰 *Amount:* ${fmtAmount}\n` +
-                                            `📅 *Date:* ${date}\n` +
-                                            `📝 *Notes:* ${result.data.description || 'N/A'}\n` +
+                                            `🏢 *${t('field_entity_client', state.lang)}:* ${entityName}\n` +
+                                            `💰 *${t('field_amount', state.lang)}:* ${fmtAmount}\n` +
+                                            `📅 *${t('field_date', state.lang)}:* ${date}\n` +
+                                            `📝 *${t('field_notes', state.lang)}:* ${result.data.description || 'N/A'}\n` +
                                             `━━━━━━━━━━━━━━━━━━\n` +
-                                            `✅ *Status:* Recorded Successfully`;
+                                            `✅ *Status:* ${t('recorded_successfully', state.lang)}`;
 
                         const isPdfRoute = downloadUrl.includes('/pdf');
                         const isImage = result.data.document_path && (
@@ -566,17 +585,16 @@ ${finalUrl}`;
                             // If it's explicitly an image and NOT a generated PDF route
                             waResult = await whatsappService.sendImage(from, downloadUrl, successText);
                         } else {
-                            // Otherwise send as document (PDF) with caption
-                            waResult = await whatsappService.sendDocument(from, downloadUrl, `Invoice_${result.data.id || 'Draft'}.pdf`, successText);
+                            // Otherwise send as document with dynamic extension
+                            const extension = result.data.document_path ? path.extname(result.data.document_path) : '.pdf';
+                            const filename = `Invoice_${result.data.id || 'Draft'}${extension}`;
+                            waResult = await whatsappService.sendDocument(from, downloadUrl, filename, successText);
                         }
-                        this.logDebug('✅ WHATSAPP MEDIA SENT', waResult);
                     } catch (waErr) {
-                        this.logDebug('❌ WHATSAPP DELIVERY FAILED', waErr.message);
                         // Fallback only if media fails
                         await whatsappService.sendTextMessage(from, "✅ *Invoice Recorded Successfully*");
                     }
                 } else {
-                    this.logDebug('⚠️ WARNING: No valid ID or URL in response');
                     await whatsappService.sendTextMessage(from, "✅ *Invoice Recorded Successfully*");
                 }
                 
@@ -585,11 +603,15 @@ ${finalUrl}`;
                 stateService.clearUserState(from);
                 await new Promise(resolve => setTimeout(resolve, 2500)); 
                 await this.sendWelcomeMenu(from);
-            } else if (textLower === 'edit') {
+            } else if (isEdit) {
                 stateService.setUserState(from, 'AWAITING_EDIT_SELECT_INVOICE', state.data);
                 await this.sendEditSelectionButtons(from, 'INVOICE');
+            } else if (isCancel) {
+                stateService.clearUserState(from);
+                await whatsappService.sendTextMessage(from, t('cancel_msg', state.lang));
+                await this.sendWelcomeMenu(from);
             } else {
-                await whatsappService.sendTextMessage(from, "Please select 'Confirm' to save this invoice or 'Edit' to make changes.\n\nNote: You may also upload the invoice document now to link it.");
+                await whatsappService.sendTextMessage(from, t('prompt_confirm_link', state.lang));
             }
             return;
         }
@@ -601,7 +623,7 @@ ${finalUrl}`;
 
           if (interactiveId === 'amt' || textLower === 'amount') {
             stateService.setUserState(from, 'AWAITING_AMOUNT_EDIT' + nextStateSuffix, state.data );
-            await whatsappService.sendTextMessage(from, "Please enter the corrected Amount:");
+            await whatsappService.sendTextMessage(from, t('prompt_edit_amount', state.lang));
           } else if (interactiveId === 'ent' || textLower === 'entity' || textLower === 'client') {
             if (isInvoice) {
                 const clients = await laravelService.getClients(from);
@@ -610,7 +632,7 @@ ${finalUrl}`;
                     await this.sendClientSelectionList(from, clients);
                 } else {
                     stateService.setUserState(from, 'AWAITING_NEW_CLIENT_NAME', state.data);
-                    await whatsappService.sendTextMessage(from, "No existing clients found. Please type the **Name of the Client** for this invoice:");
+                    await whatsappService.sendTextMessage(from, t('prompt_no_clients', state.lang));
                 }
             } else {
                 const suppliers = await laravelService.getSuppliers(from);
@@ -619,19 +641,19 @@ ${finalUrl}`;
                     await this.sendSupplierSelectionList(from, suppliers);
                 } else {
                     stateService.setUserState(from, 'AWAITING_ENTITY_EDIT', state.data);
-                    await whatsappService.sendTextMessage(from, "No existing suppliers found. Please type the **Supplier Name** for this expense:");
+                    await whatsappService.sendTextMessage(from, t('prompt_no_suppliers', state.lang));
                 }
             }
           } else if (interactiveId === 'date' || textLower === 'date') {
             stateService.setUserState(from, (isInvoice ? 'AWAITING_DATE_EDIT_INVOICE' : 'AWAITING_DATE_EDIT'), state.data );
-            await whatsappService.sendTextMessage(from, "Please enter the corrected Date (YYYY-MM-DD):");
+            await whatsappService.sendTextMessage(from, t('prompt_edit_date', state.lang));
           } else if (interactiveId === 'pay' || textLower === 'payment via') {
             stateService.setUserState(from, (isInvoice ? 'AWAITING_PAYMENT_METHOD_EDIT_INVOICE' : 'AWAITING_PAYMENT_METHOD_EDIT'), state.data );
             await this.sendPaymentMethodSelectionList(from, isInvoice ? 'INVOICE' : 'EXPENSE');
           } else if (interactiveId === 'cat' || textLower === 'category') {
             if (isInvoice) {
                 stateService.setUserState(from, 'AWAITING_CATEGORY_EDIT_INVOICE', state.data);
-                await whatsappService.sendTextMessage(from, "Please enter the corrected Category:");
+                await whatsappService.sendTextMessage(from, t('prompt_edit_category', state.lang));
             } else {
                 const categories = await laravelService.getCategories(from);
                 stateService.setUserState(from, 'AWAITING_EXPENSE_CATEGORY', state.data);
@@ -639,10 +661,10 @@ ${finalUrl}`;
             }
           } else if (interactiveId === 'desc' || textLower === 'description' || textLower === 'notes') {
             stateService.setUserState(from, 'AWAITING_DESCRIPTION_EDIT' + nextStateSuffix, state.data);
-            await whatsappService.sendTextMessage(from, isInvoice ? "Please enter the corrected Notes:" : "Please enter the corrected Description:");
+            await whatsappService.sendTextMessage(from, t('prompt_edit_notes', state.lang));
           } else if (interactiveId === 'all' || textLower === 're-submit entry') {
             stateService.setUserState(from, 'IDLE');
-            await whatsappService.sendTextMessage(from, "Please provide the corrected details:");
+            await whatsappService.sendTextMessage(from, t('prompt_edit_details', state.lang));
           }
           return;
         }
@@ -684,11 +706,11 @@ ${finalUrl}`;
 
             if (isInvoice) {
                 stateService.setUserState(from, 'AWAITING_INVOICE_CONFIRMATION', state.data);
-                await whatsappService.sendTextMessage(from, "Entry updated.");
+                await whatsappService.sendTextMessage(from, t('entry_updated', state.lang));
                 await this.sendInvoiceReviewButtons(from, state.data.invoiceData, state.data.filePath);
             } else {
                 stateService.setUserState(from, 'AWAITING_EXPENSE_CONFIRMATION', state.data);
-                await whatsappService.sendTextMessage(from, "Entry updated.");
+                await whatsappService.sendTextMessage(from, t('entry_updated', state.lang));
                 await this.sendExpenseReviewButtons(from, state.data.expenseData, state.data.receiptPath);
             }
             return;
@@ -697,35 +719,36 @@ ${finalUrl}`;
         // --- Handle Statement Month Confirmation ---
         if (state.state === 'AWAITING_STATEMENT_CONFIRMATION') {
             if (interactiveId === 'confirm' || textLower === 'confirm') {
-                await whatsappService.sendTextMessage(from, `Uploading statement for ${state.data.monthYear}...`);
+                await whatsappService.sendTextMessage(from, t('uploading_stmt', state.lang).replace('${monthYear}', state.data.monthYear));
                 const result = await laravelService.uploadStatement(state.data.filePath, from, state.data.monthYear);
                 
-                let feedback = "*Bank statement successfully uploaded to the portal.*";
                 if (result.data && (result.data.download_url || result.data.id)) {
                     const downloadUrl = result.data.download_url || `${laravelService.publicUrl}/api/bot/file/${result.data.id}`;
                     
                     if (downloadUrl.includes('localhost') || downloadUrl.includes('127.0.0.1')) {
-                        console.warn(`⚠️ [WARNING] Sending localhost URL to Meta (Statement): ${downloadUrl}`);
                     }
-                    console.log(`📄 [INFO] Delivering Bank Statement: ${downloadUrl}`);
 
-                    feedback += `\n\n---
-📥 *OPEN STATEMENT*
-${downloadUrl}`;
+                    // 1. Send text confirmation first (standalone)
+                    await whatsappService.sendTextMessage(from, t('stmt_uploaded_success', state.lang));
                     
-                    // Also send as a proper Document Attachment
+                    // 2. Send the PDF attachment
                     await whatsappService.sendDocument(from, downloadUrl, `Statement_${state.data.monthYear.replace(' ', '_')}.pdf`);
+                } else {
+                    // Fallback if no URL
+                    await whatsappService.sendTextMessage(from, t('stmt_uploaded_success', state.lang));
                 }
 
-                await whatsappService.sendTextMessage(from, feedback);
+                // Give Meta/Client time to process PDF before sending Menu to ensure correct order
+                await new Promise(resolve => setTimeout(resolve, 1500));
+
                 stateService.clearUserState(from);
                 await this.sendWelcomeMenu(from);
-            } else if (interactiveId === 'edit_month' || textLower === 'edit') {
+            } else if (interactiveId === 'edit_month' || isEdit) {
                 stateService.setUserState(from, 'AWAITING_STATEMENT_MONTH', { filePath: state.data.filePath });
-                await whatsappService.sendTextMessage(from, "Please specify the correct Month/Year (e.g., April 2026):");
-            } else if (interactiveId === 'cancel' || textLower === 'cancel') {
+                await whatsappService.sendTextMessage(from, t('prompt_report_period', state.lang));
+            } else if (isCancel) {
                 stateService.clearUserState(from);
-                await whatsappService.sendTextMessage(from, "Upload cancelled. Let me know if you need anything else!");
+                await whatsappService.sendTextMessage(from, t('cancel_msg', state.lang));
                 await this.sendWelcomeMenu(from);
             }
             return;
@@ -736,7 +759,7 @@ ${downloadUrl}`;
             const monthYear = await aiService.parseStatementMonth(text, from, true);
             
             if (monthYear === 'Unknown') {
-                await whatsappService.sendTextMessage(from, "I couldn't identify a valid month for the statement. Please specify the **Month and Year** (e.g., March 2026):");
+                await whatsappService.sendTextMessage(from, t('error_invalid_date', state.lang));
                 return;
             }
 
@@ -752,7 +775,7 @@ ${downloadUrl}`;
         if (state.state === 'AWAITING_INVOICE_CLIENT') {
             if (interactiveId === 'skip_client') {
                 stateService.setUserState(from, 'AWAITING_NEW_CLIENT_NAME', state.data);
-                await whatsappService.sendTextMessage(from, "Please type the **Name of the Client** for this invoice:");
+                await whatsappService.sendTextMessage(from, t('prompt_client_name', state.lang));
                 return;
             }
             const clientId = interactiveId || text.split('|')[0].trim();
@@ -771,7 +794,7 @@ ${downloadUrl}`;
             if (!interactiveId) { // Only validate if it's raw text
                 const isValid = await aiService.validateFieldAI(text, 'ENTITY', from, true);
                 if (!isValid) {
-                    await whatsappService.sendTextMessage(from, "I'm sorry, that doesn't look like a valid client name. 🏢\n\nPlease type the **Name of the Client** for this invoice:");
+                    await whatsappService.sendTextMessage(from, t('error_invalid_client', state.lang));
                     return;
                 }
             }
@@ -800,7 +823,7 @@ ${downloadUrl}`;
         if (state.state === 'AWAITING_EXPENSE_CATEGORY' && !detectedIntent) {
             if (interactiveId === 'skip_category') {
                 stateService.setUserState(from, 'AWAITING_CATEGORY_MANUAL', state.data);
-                await whatsappService.sendTextMessage(from, "Please type the **Category Name** for this expense:");
+                await whatsappService.sendTextMessage(from, t('prompt_edit_category', state.lang));
                 return;
             }
             state.data.expenseData.category = interactiveId || text;
@@ -817,7 +840,7 @@ ${downloadUrl}`;
         if (state.state === 'AWAITING_EXPENSE_ENTITY' && !detectedIntent) {
             if (interactiveId === 'skip_supplier') {
                 stateService.setUserState(from, 'AWAITING_ENTITY_EDIT', state.data);
-                await whatsappService.sendTextMessage(from, "Please type the Supplier name:");
+                await whatsappService.sendTextMessage(from, t('prompt_supplier_name', state.lang));
                 return;
             }
             
@@ -825,7 +848,7 @@ ${downloadUrl}`;
             if (!interactiveId) { 
                 const isValid = await aiService.validateFieldAI(text, 'ENTITY', from, true);
                 if (!isValid) {
-                    await whatsappService.sendTextMessage(from, "I'm sorry, that doesn't look like a valid supplier name. 🏢\n\nPlease type the **Supplier Name** for this expense:");
+                    await whatsappService.sendTextMessage(from, t('error_invalid_entity', state.lang));
                     return;
                 }
             }
@@ -840,7 +863,7 @@ ${downloadUrl}`;
             const amt = parsed.amount || parseFloat(text.replace(/[^0-9.]/g, ''));
             
             if (!amt || isNaN(amt)) {
-                await whatsappService.sendTextMessage(from, "I'm sorry, I couldn't find a valid amount in your message. 🔢\n\nPlease provide the **Amount** (e.g., '50.00'):");
+                await whatsappService.sendTextMessage(from, t('error_invalid_amount', state.lang));
                 return;
             }
 
@@ -879,6 +902,7 @@ ${downloadUrl}`;
 
       // 2. Media Handler (Image, Document)
       if (type === 'image' || type === 'document') {
+            const state = await stateService.getUserState(from);
             const isCapturing = state.state !== 'IDLE';
 
             // --- SMART AI TRIGGER ---
@@ -890,13 +914,12 @@ ${downloadUrl}`;
                             state.state.includes('CATEGORY') ||
                             state.state.includes('AMOUNT') ||
                             state.state.includes('DATE');
-
             if (!isCapturing) {
-                await whatsappService.sendTextMessage(from, `Analyzing ${type} attachment...`);
+                await whatsappService.sendTextMessage(from, t('analyzing_media', state.lang, { type }));
             } else if (needsAI) {
-                await whatsappService.sendTextMessage(from, `Processing ${type} to complete your record...`);
+                await whatsappService.sendTextMessage(from, t('processing_media', state.lang, { type }));
             } else {
-                await whatsappService.sendTextMessage(from, `Linking ${type} to current record...`);
+                await whatsappService.sendTextMessage(from, t('linking_media', state.lang, { type }));
             }
             
             const mediaId = message[type].id;
@@ -906,7 +929,7 @@ ${downloadUrl}`;
             const stats = fs.statSync(localPath);
             const fileSizeInMegabytes = stats.size / (1024 * 1024);
             if (fileSizeInMegabytes > 2.0) {
-                await whatsappService.sendTextMessage(from, `File exceeds 2MB limit.`);
+                await whatsappService.sendTextMessage(from, t('file_too_large', state.lang));
                 if (fs.existsSync(localPath)) fs.unlinkSync(localPath);
                 return;
             }
@@ -921,7 +944,7 @@ ${downloadUrl}`;
                         // File First (IDLE) = Bank Statement.
                         if (!isCapturing) {
                             stateService.setUserState(from, 'AWAITING_STATEMENT_MONTH', { filePath: localPath });
-                            await whatsappService.sendTextMessage(from, "Bank Statement detected (Image). 🏦\n\nPlease specify the *Month/Year* for this statement (e.g., April 2026):");
+                            await whatsappService.sendTextMessage(from, t('stmt_detected_image', state.lang));
                             return;
                         } else {
                             // Already in a recording flow - just link as proof
@@ -960,8 +983,8 @@ ${downloadUrl}`;
       // Fallback: If nothing matched, handle based on current state
       if (type !== 'status' && !interactiveId) {
         if (state.state && state.state !== 'IDLE') {
-            const flowName = state.state.includes('INVOICE') ? 'invoice' : (state.state.includes('STATEMENT') ? 'statement' : 'expense');
-            await whatsappService.sendTextMessage(from, `🤔 I'm sorry, I didn't quite get that for your ${flowName}. \n\nPlease provide the details or type 'menu' to cancel.`);
+            const flowName = state.state.includes('INVOICE') ? t('label_client', state.lang).toLowerCase() : (state.state.includes('STATEMENT') ? t('btn_upload_stmt', state.lang).toLowerCase() : t('btn_record_expense', state.lang).toLowerCase());
+            await whatsappService.sendTextMessage(from, t('unrecognized_flow', state.lang, { flow: flowName }));
         } else {
             await this.sendWelcomeMenu(from);
         }
@@ -976,9 +999,9 @@ ${downloadUrl}`;
    */
   async handleDocumentRouting(from, data, filePath, type) {
     const currentState = await stateService.getUserState(from);
-    console.log(`[DEBUG] ROUTING START - State: ${currentState?.state}`);
+    logger.debug(`[DEBUG] ROUTING START - State: ${currentState?.state}`);
     const existingData = (currentState && currentState.data) ? (currentState.data.expenseData || currentState.data.invoiceData || {}) : {};
-    console.log(`[DEBUG] Existing Data:`, JSON.stringify(existingData));
+    logger.debug(`[DEBUG] Existing Data:`, existingData);
     const today = new Date().toISOString().split('T')[0];
     const invalidVals = ['unknown', 'general', 'n/a', 'none', 'null', 'undefined', ''];
     
@@ -1000,7 +1023,7 @@ ${downloadUrl}`;
         payment_method: 'WhatsApp',
         ...data 
     };
-console.log(data,  "kjlkjlkjlkjlkjlkj")
+
     // --- 1. NORMALIZATION (AI -> Internal Fields) ---
     // Move AI 'entity' to 'client_name' or 'supplier_name' before merging
     if (mergedData.documentType === 'INVOICE' && mergedData.entity && !invalidVals.includes(mergedData.entity.toLowerCase())) {
@@ -1108,7 +1131,7 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
         // STRICTLY preserve original type and data during an active session
         if (currentState.state.includes('EXPENSE')) {
             mergedData.documentType = 'EXPENSE';
-            console.log(mergedData, "mergedDatamergedData")
+
             const newEntityName = mergedData.entity;
             const isEntityValid = newEntityName && !invalidVals.includes(newEntityName.toLowerCase());
 
@@ -1119,15 +1142,12 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
                 const isAnotherKnownSupplier = suppliers.some(s => s.name && s.name.toLowerCase().replace(/[.!]$/, '').trim() === searchName);
                 
                 if (isAnotherKnownSupplier) {
-                    console.log(`[DEBUG] Detected context switch to another known supplier: ${newEntityName}`);
                     mergedData.supplier_id = null;
                 } else {
-                    console.log(`[DEBUG] Potential noise detected: "${newEntityName}". Restoring context: ${existingData.entity}`);
                     mergedData.supplier_id = existingData.supplier_id;
                     mergedData.entity = existingData.entity;
                 }
             } else if (existingData.supplier_id && (!mergedData.entity || invalidVals.includes(mergedData.entity.toLowerCase()))) {
-                console.log(`[DEBUG] Missing/Invalid entity from AI. Restoring context: ${existingData.entity}`);
                 mergedData.supplier_id = existingData.supplier_id;
                 mergedData.entity = existingData.entity;
             }
@@ -1191,10 +1211,10 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
             await this.sendStatementReviewButtons(from, monthYear);
         } else if (monthYear) {
             stateService.setUserState(from, 'AWAITING_STATEMENT_FILE', { monthYear });
-            await whatsappService.sendTextMessage(from, `Got it. Statement for ${monthYear}.\n\n📎 Please upload the PDF or Image of the statement to complete the record.`);
+            await whatsappService.sendTextMessage(from, t('stmt_got_it', state.lang, { monthYear }));
         } else {
             stateService.setUserState(from, 'AWAITING_STATEMENT_MONTH', { filePath });
-            await whatsappService.sendTextMessage(from, "Bank Statement detected.\n\nPlease specify the Month/Year for this statement (e.g., March 2026).");
+            await whatsappService.sendTextMessage(from, t('stmt_detected_pdf', state.lang));
         }
     } else if (mergedData.documentType === 'INVOICE') {
         const inv = mergedData;
@@ -1204,8 +1224,8 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
         // If it's a voice note (audio), we REQUIRE an amount to be extracted before proceeding.
         const isAudio = filePath && filePath.endsWith('.ogg');
         if (!inv.amount && (!filePath || isAudio)) {
-            const source = isAudio ? "in that voice note" : "in your message";
-            await whatsappService.sendTextMessage(from, `🤔 I couldn't find an amount or valid details ${source}. \n\nPlease provide the invoice details (e.g. '500.00 from ABC') or upload the document.`);
+            const source = isAudio ? t('voice_note', state.lang).toLowerCase() : t('btn_menu', state.lang).toLowerCase(); // Fallback label
+            await whatsappService.sendTextMessage(from, t('error_no_amount_found', state.lang, { source }));
             return;
         }
 
@@ -1218,7 +1238,7 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
         // 1. Date Check
         if (!inv.date) {
             stateService.setUserState(from, 'AWAITING_INVOICE_DATE', { filePath, invoiceData: inv });
-            await whatsappService.sendTextMessage(from, "Invoice detected. Please provide the Invoice Date (e.g., 2026-04-02):");
+            await whatsappService.sendTextMessage(from, t('prompt_invoice_date', state.lang));
             return;
         } 
         
@@ -1231,7 +1251,7 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
                 await this.sendClientSelectionList(from, clients);
             } else {
                 stateService.setUserState(from, 'AWAITING_NEW_CLIENT_NAME', { filePath, invoiceData: inv });
-                await whatsappService.sendTextMessage(from, "The AI couldn't identify the client. Please type the **Name of the Client** for this invoice:");
+                await whatsappService.sendTextMessage(from, t('prompt_ai_no_client', state.lang));
             }
             return;
         }
@@ -1265,7 +1285,7 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
 
             if (!mergedData.amount || parseFloat(mergedData.amount) <= 0) {
                 stateService.setUserState(from, 'AWAITING_EXPENSE_AMOUNT', { expenseData: mergedData, receiptPath: filePath });
-                await whatsappService.sendTextMessage(from, "Please provide the **Amount** for this expense (e.g. '150 USD' or just '150'):");
+                await whatsappService.sendTextMessage(from, t('error_invalid_amount', state.lang));
                 return;
             }
 
@@ -1281,7 +1301,7 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
                 } else {
                     // No suppliers found, ask to type it or skip
                     stateService.setUserState(from, 'AWAITING_ENTITY_EDIT', { expenseData: mergedData, receiptPath: filePath });
-                    await whatsappService.sendTextMessage(from, "The AI couldn't identify the supplier. Please type the Supplier name (or type 'General' to skip):");
+                    await whatsappService.sendTextMessage(from, t('prompt_ai_no_supplier', state.lang));
                 }
             } else if (!mergedData.payment_method || invalidValues.includes(mergedData.payment_method.toLowerCase()) || mergedData.payment_method.toLowerCase() === 'whatsapp') {
                 stateService.setUserState(from, 'AWAITING_EXPENSE_PAYMENT_METHOD', { expenseData: mergedData, receiptPath: filePath });
@@ -1328,15 +1348,16 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
   // --- INTERACTIVE UI HELPERS ---
 
   async sendReportMenu(from) {
+      const state = await stateService.getUserState(from);
       const [clients, suppliers] = await Promise.all([
           laravelService.getClients(from),
           laravelService.getSuppliers(from)
       ]);
-      const body = `📊 *Select a Report*\n\nTap a category or name below to view the financial breakdown:`;
+      const body = t('report_select_title', state.lang);
       const rowsGeneral = [
-          { id: 'rep_gen_unpaid', title: 'Unpaid Invoices' },
-          { id: 'rep_gen_month', title: 'Monthly Summary' },
-          { id: 'rep_gen_search', title: 'Search by Name' }
+          { id: 'rep_gen_unpaid', title: t('btn_unpaid_invoices', state.lang) },
+          { id: 'rep_gen_month', title: t('btn_monthly_summary', state.lang) },
+          { id: 'rep_gen_search', title: t('btn_search_name', state.lang) }
       ];
       const rowsClients = (clients || []).slice(0, 3).map(c => ({
           id: `rep_c_${c.id}`,
@@ -1347,30 +1368,31 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
           title: s.name.substring(0, 24)
       }));
       
-      const sections = [{ title: "General Reports", rows: rowsGeneral }];
-      if (rowsClients.length > 0) sections.push({ title: "Recent Clients", rows: rowsClients });
-      if (rowsSuppliers.length > 0) sections.push({ title: "Recent Suppliers", rows: rowsSuppliers });
+      const sections = [{ title: t('section_general_reports', state.lang), rows: rowsGeneral }];
+      if (rowsClients.length > 0) sections.push({ title: t('section_recent_clients', state.lang), rows: rowsClients });
+      if (rowsSuppliers.length > 0) sections.push({ title: t('section_recent_suppliers', state.lang), rows: rowsSuppliers });
       
-      return whatsappService.sendInteractiveList(from, body, "Options", sections);
+      return whatsappService.sendInteractiveList(from, body, t('list_trigger_options', state.lang), sections);
   }
 
   async handleReportMenuSelection(from, interactiveId) {
+      const state = await stateService.getUserState(from);
       if (interactiveId === 'rep_gen_month') {
-          await whatsappService.sendTextMessage(from, "Retrieving your account status summary...");
+          await whatsappService.sendTextMessage(from, t('fetching_status', state.lang));
           const stats = await laravelService.getAccountStatus(from);
           await this.sendStatusInteractive(from, stats);
       } else if (interactiveId === 'rep_gen_unpaid') {
           const stats = await laravelService.getAccountStatus(from);
           if (stats.total_unpaid_sum > 0) {
-              await whatsappService.sendTextMessage(from, `🚨 *Unpaid Invoices Alert*\n\nYou currently have *${stats.total_unpaid_sum}* pending to be paid by your clients across *${stats.invoicesCount}* issued invoices.\n\n_Log in to your portal to view full details._`);
+              await whatsappService.sendTextMessage(from, t('alert_unpaid_total', state.lang, { total: stats.total_unpaid_sum, count: stats.invoicesCount }));
           } else if (stats.invoicesCount > 0) {
-              await whatsappService.sendTextMessage(from, `✅ *Great news!*\n\nAll your *${stats.invoicesCount}* issued invoices have been fully paid. Your accounts are currently up to date.`);
+              await whatsappService.sendTextMessage(from, t('alert_no_unpaid', state.lang, { count: stats.invoicesCount }));
           } else {
-              await whatsappService.sendTextMessage(from, `ℹ️ *No Invoices Found*\n\nYou haven't issued any invoices yet. You can start by sending a document or typing 'Create Invoice'.`);
+              await whatsappService.sendTextMessage(from, t('alert_no_invoices', state.lang));
           }
       } else if (interactiveId === 'rep_gen_search') {
           stateService.setUserState(from, 'AWAITING_REPORT_SEARCH');
-          await whatsappService.sendTextMessage(from, "🔍 Please type the name of the Client or Supplier you are looking for:");
+          await whatsappService.sendTextMessage(from, t('prompt_search_name', state.lang));
       } else if (interactiveId.startsWith('rep_c_') || interactiveId.startsWith('rep_s_')) {
           const parts = interactiveId.split('_');
           const isClient = parts[1] === 'c';
@@ -1391,43 +1413,73 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
   }
 
   async sendReportPeriodButtons(from) {
+      const state = await stateService.getUserState(from);
       const sections = [
         {
-          title: "Standard Periods",
+          title: t('section_standard_periods', state.lang),
           rows: [
-            { id: 'rep_period_this', title: 'This Month' },
-            { id: 'rep_period_last', title: 'Last Month' },
-            { id: 'rep_period_all', title: 'All Time' }
+            { id: 'rep_period_this', title: t('this_month', state.lang) },
+            { id: 'rep_period_last', title: t('last_month_name', state.lang) },
+            { id: 'rep_period_all', title: t('all_time', state.lang) }
           ]
         },
         {
-          title: "Custom Search",
+          title: t('section_custom_search', state.lang),
           rows: [
-            { id: 'rep_period_custom', title: 'Type Custom Month', description: 'Search any historical month' }
+            { id: 'rep_period_custom', title: t('btn_custom_month', state.lang), description: t('desc_custom_month', state.lang) }
           ]
         }
       ];
-      await whatsappService.sendInteractiveList(from, `📅 *Time Period*\n\nFor which time period would you like this report?`, "Select Period", sections);
+      await whatsappService.sendInteractiveList(from, `${t('report_period_title', state.lang)}\n\n${t('report_period_body', state.lang)}`, t('list_trigger_period', state.lang), sections);
   }
 
   async sendWelcomeMenu(from) {
-    const body = `*Accounting Assistant Management Portal*\n\nPlease select an action below to manage your bookkeeping:`;
+    const state = await stateService.getUserState(from);
+    const body = t('welcome', state.lang);
+    
     const sections = [
       {
-        title: "Primary Actions",
+        title: t('btn_menu', state.lang),
         rows: [
-          { id: 'status', title: 'Account Status', description: 'Monthly financial summary' },
-          { id: 'record', title: 'Record Expense', description: 'Submit an expense or receipt' },
-          { id: 'inv', title: 'Record Invoice', description: 'Submit a sales invoice' },
-          { id: 'stmt', title: 'Upload Statement', description: 'Upload bank statement (PDF)' },
-          { id: 'quick_reports', title: 'Quick Reports', description: 'View client & supplier summaries' }
+          { 
+            id: 'status', 
+            title: t('btn_status', state.lang), 
+            description: t('desc_status', state.lang) 
+          },
+          { 
+            id: 'record', 
+            title: t('btn_record_expense', state.lang), 
+            description: t('desc_record_expense', state.lang) 
+          },
+          { 
+            id: 'inv', 
+            title: t('btn_record_invoice', state.lang), 
+            description: t('desc_record_invoice', state.lang) 
+          },
+          { 
+            id: 'quick_reports', 
+            title: t('btn_reports', state.lang), 
+            description: t('desc_reports', state.lang) 
+          },
+          { 
+            id: 'stmt', 
+            title: t('btn_upload_stmt', state.lang), 
+            description: t('desc_upload_stmt', state.lang) 
+          }
         ]
       }
     ];
-    return whatsappService.sendInteractiveList(from, body, "Menu Actions", sections);
+
+    return whatsappService.sendInteractiveList(
+        from, 
+        body, 
+        t('menu_trigger', state.lang), 
+        sections
+    );
   }
 
   async sendStatusInteractive(from, stats) {
+    const state = await stateService.getUserState(from);
     const { targetMonth, targetYear } = stats;
 
     // 1. Parallel fetch details (Invoices, Expenses, Statements) - Synchronized with target period
@@ -1442,45 +1494,48 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
     const balance = income - expensesTotal;
     const vat = stats.vatPayable || 0;
     
+    // Localized Currency Formatter
+    const currency = stats.currency || 'MAD';
+    const fmt = (num) => {
+        const val = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { 
+            minimumFractionDigits: 2, 
+            maximumFractionDigits: 2 
+        }).format(num);
+        return `${val} ${currency}`;
+    };
+
+    // Granular Status Logic (Restored from previous English version but localized)
     let statusIcon = '⚪';
-    let statusText = 'No activity recorded yet';
+    let statusText = t('status_no_activity', state.lang);
     
     if (stats.invoicesCount > 0) {
         if (stats.pendingReviewCount > 0) {
             statusIcon = '🟡';
-            statusText = 'Pending Review (Check portal)';
+            statusText = t('status_pending_review', state.lang);
         } else if (stats.statementsCount > 0) {
             statusIcon = '🟢';
-            statusText = 'Accounts Validated';
+            statusText = t('status_validated', state.lang);
         } else {
             statusIcon = '🟠';
-            statusText = 'Missing Documents (Action Required)';
+            statusText = t('status_missing_docs', state.lang);
         }
     } else if (stats.statementsCount > 0) {
         statusIcon = '🟠';
-        statusText = 'Invoices Missing (Action Required)';
+        statusText = t('status_invoices_missing', state.lang);
     }
 
     const missing = [];
-    if (!stats.statementsCount) missing.push('Bank Statement');
-    if (stats.invoicesCount === 0) missing.push('Invoices');
-
-    // Currency formatting
-    const currency = stats.currency || 'MAD';
-    const fmt = (num) => {
-        const val = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(num);
-        return `${val} ${currency}`;
-    };
+    if (!stats.statementsCount) missing.push(t('btn_upload_stmt', state.lang).replace('📄', '').trim());
+    if (stats.invoicesCount === 0) missing.push(t('btn_record_invoice', state.lang));
 
     // --- DETAILED SECTIONS ---
     let detailText = '';
 
     // Unpaid Invoices List
     if (invoices.length > 0) {
-        detailText += `📑 *Unpaid Invoices (Top 3):*\n`;
+        detailText += `📑 *${t('unpaid_invoices', state.lang)} (Top 3):*\n`;
         invoices.slice(0, 3).forEach(inv => {
             const client = inv.client?.client_name || 'Client';
-            // Sum HT as a reasonable summary
             const amount = (inv.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0);
             detailText += `• ${client}: ${fmt(amount)}\n`;
         });
@@ -1489,7 +1544,7 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
 
     // Recent Expenses List
     if (expenses.length > 0) {
-        detailText += `🏷️ *Recent Expenses (Top 3):*\n`;
+        detailText += `🏷️ *${t('recent_expenses', state.lang)} (Top 3):*\n`;
         expenses.slice(0, 3).forEach(exp => {
             const category = exp.category?.name || 'General';
             const amount = parseFloat(exp.total_ttc || 0);
@@ -1500,225 +1555,217 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
 
     // Statement History Hint
     if (statements.length > 0) {
-        const last = statements[0]; // Sorted DESC in backend
-        detailText += `📅 *Last Statement:* ${last.month_year} (${last.status || 'Processed'})\n\n`;
+        const last = statements[0];
+        detailText += `📅 *${t('last_statement', state.lang)}:* ${last.month_year} (${last.status || t('processed', state.lang)})\n\n`;
     }
 
     const missingText = missing.length > 0 
-        ? `⚠️ *Missing:* ${missing.join(', ')}\n_(Please upload these to the portal or send them here)_` 
-        : (statusIcon === '🟢' 
-            ? '✅ *All required documents received for this month.*'
-            : (stats.monthStatus === 'MISSING_DOCUMENTS' 
-                ? `🟠 *Note:* Some transaction receipts or missing details still need your attention in the portal.`
-                : '✅ *All required documents received for this month.*'));
+        ? `${t('report_missing', state.lang)} ${missing.join(', ')}\n_(${t('upload_portal_msg', state.lang)})_` 
+        : t('report_ready', state.lang);
 
-    let body = `📊 *Financial Summary:* ${stats.month}\n` +
+    let body = `${t('report_title', state.lang)}: ${stats.month}\n` +
                `━━━━━━━━━━━━━━━━━━\n\n` +
-               `💶 *BUSINESS PERFORMANCE*\n` +
-               `* Total Income:   ${fmt(income)}\n` +
-               `* Total Expenses: ${fmt(expensesTotal)}\n` +
+               `${t('report_performance', state.lang)}\n` +
+               `* ${t('report_income', state.lang)}:   ${fmt(income)}\n` +
+               `* ${t('report_expenses', state.lang)}: ${fmt(expensesTotal)}\n` +
                `━━━━━━━━━━━━━━━━━━\n` +
-               `🏦 *NET BALANCE:  ${fmt(balance)}*\n\n` +
-               `📋 *TAX & VAT ESTIMATE*\n` +
-               `* VAT Payable:    ${fmt(vat)}\n\n` +
-               `📈 *BOOKKEEPING PROGRESS*\n` +
-               `* Status: ${statusIcon} ${statusText}\n\n` +
+               `🏦 *${t('report_balance', state.lang)}:  ${fmt(balance)}*\n\n` +
+               `${t('report_tax', state.lang)}\n` +
+               `* ${t('report_vat', state.lang)}:    ${fmt(vat)}\n\n` +
+               `${t('report_progress', state.lang)}\n` +
+               `* ${t('report_status', state.lang)}: ${statusIcon} ${statusText}\n\n` +
                detailText +
                `${missingText}\n\n` +
                `━━━━━━━━━━━━━━━━━━\n` +
-               `Select an action below to manage your records:`;
+               `${t('select_action', state.lang)}`;
                
     const buttons = [
-      { id: 'record', title: 'Record Expense' },
-      { id: 'inv', title: 'Record Invoice' },
-      { id: 'menu', title: 'Main Menu' }
+      { id: 'record', title: t('btn_record_expense', state.lang) },
+      { id: 'inv', title: t('btn_record_invoice', state.lang) },
+      { id: 'menu', title: t('btn_menu', state.lang) }
     ];
     return whatsappService.sendInteractiveButtons(from, body, buttons);
   }
 
   async sendExpenseReviewButtons(from, expenseData, receiptPath = null) {
+    const state = await stateService.getUserState(from);
     const path = require('path');
-    const invalidNotes = ['unknown', 'general', 'n/a', 'none', 'null', 'undefined', 'processed via ai'];
-    let notes = expenseData.description || '';
-    if (!notes || invalidNotes.includes(notes.toLowerCase())) {
-        notes = 'Business Expense';
-    }
+    let notes = expenseData.description || t('business_expense', state.lang);
 
-    let body = `*Reviewing Draft Expense:*\n` +
-      `*Amount:* ${expenseData.amount} ${expenseData.currency || 'USD'}\n` +
-      `*Date:* ${expenseData.date || 'Not provided'}\n` +
-      `*Supplier:* ${expenseData.entity || 'General'}\n` +
-      `*Category:* ${expenseData.category || 'General'}\n` +
-      `*Payment Via:* ${expenseData.payment_method || 'WhatsApp'}\n` +
-      `*Notes:* ${notes}\n\n`;
+    // Localize Payment Method Display
+    const rawPayment = expenseData.payment_method || 'WhatsApp';
+    const payKey = `pay_${rawPayment.replace(/[\s\/]/g, '_')}`;
+    const localizedPayment = t(payKey, state.lang);
+
+    let body = `*${t('review_expense', state.lang)}*\n` +
+      `*${t('field_amount', state.lang)}:* ${expenseData.amount} ${expenseData.currency || 'MAD'}\n` +
+      `*${t('field_date', state.lang)}:* ${expenseData.date || '---'}\n` +
+      `*${t('field_entity_supplier', state.lang)}:* ${expenseData.entity || '...'}\n` +
+      `*${t('field_category', state.lang)}:* ${expenseData.category || '...'}\n` +
+      `*${t('field_payment', state.lang)}:* ${localizedPayment}\n` +
+      `*${t('field_notes', state.lang)}:* ${notes}\n\n`;
 
     if (receiptPath) {
       const fileName = path.basename(receiptPath);
-      const isAudio = fileName.endsWith('.ogg');
-      
-      if (!isAudio) {
+      if (!fileName.endsWith('.ogg')) {
         const previewUrl = `${config.botPublicUrl}/storage/${fileName}`;
-        body += `_Please confirm to save this entry._\n\n` +
-                `📄 *Image Attached:*\n${previewUrl}`;
+        body += `📄 *${t('image_attached', state.lang)}:*\n${previewUrl}`;
       } else {
-        body += `🎙️ *Voice Note:* Processed\n\n_Please confirm the details extracted from your voice note._`;
+        body += `🎙️ *${t('voice_note', state.lang)}:* ${t('processed', state.lang)}`;
       }
     } else {
-      body += `You may upload a photo of the receipt now to link it, or confirm to save as text-only.`;
+      body += `\n${t('prompt_upload_media_optional', state.lang)}\n`;
     }
     
     const buttons = [
-      { id: 'confirm', title: 'Confirm' },
-      { id: 'edit', title: 'Edit' }
+      { id: 'confirm', title: t('btn_confirm', state.lang) },
+      { id: 'edit', title: t('btn_edit', state.lang) },
+      { id: 'cancel', title: t('btn_cancel', state.lang) }
     ];
     return whatsappService.sendInteractiveButtons(from, body, buttons);
   }
 
   async sendInvoiceReviewButtons(from, invoiceData, filePath = null) {
+    const state = await stateService.getUserState(from);
     const path = require('path');
-    const invalidNotes = ['unknown', 'general', 'n/a', 'none', 'null', 'undefined', 'processed via ai'];
-    let notes = invoiceData.description || '';
-    if (!notes || invalidNotes.includes(notes.toLowerCase())) {
-        notes = 'Invoice for services rendered';
-    }
+    let notes = invoiceData.description || t('services_rendered', state.lang);
 
-    let body = `*Reviewing Draft Invoice:*\n` +
-      `*Amount:* ${invoiceData.amount} ${invoiceData.currency || 'USD'}\n` +
-      `*Date:* ${invoiceData.date || 'Not provided'}\n` +
-      `*Client:* ${invoiceData.client_name || 'General'}\n`;
+    // Localize Payment Method Display
+    const rawPayment = invoiceData.payment_method || 'WhatsApp';
+    const payKey = `pay_${rawPayment.replace(/[\s\/]/g, '_')}`;
+    const localizedPayment = t(payKey, state.lang);
 
-    // Robust Status Display
-    const statusVal = (invoiceData.status || 'ISSUED').toUpperCase();
-    const statusEmoji = statusVal.includes('PAID') ? '✅' : 
-                        (statusVal.includes('PENDING') ? '⏳' : 
-                        (statusVal.includes('ISSUED') ? '📑' : '📄'));
-    
-    body += `*Status:* ${statusVal} ${statusEmoji}\n` +
-      `*Payment Via:* ${invoiceData.payment_method || 'WhatsApp'}\n` +
-      `*Notes:* ${notes}\n\n`;
+    let body = `*${t('review_invoice', state.lang)}*\n` +
+      `*${t('field_amount', state.lang)}:* ${invoiceData.amount} ${invoiceData.currency || 'MAD'}\n` +
+      `*${t('field_date', state.lang)}:* ${invoiceData.date || '---'}\n` +
+      `*${t('field_entity_client', state.lang)}:* ${invoiceData.entity || '...'}\n` +
+      `*${t('field_payment', state.lang)}:* ${localizedPayment}\n` +
+      `*${t('field_status', state.lang)}:* ${invoiceData.status || '...'}\n` +
+      `*${t('field_notes', state.lang)}:* ${notes}\n\n`;
 
     if (filePath) {
       const fileName = path.basename(filePath);
-      const isAudio = fileName.endsWith('.ogg');
-      
-      if (!isAudio) {
+      if (!fileName.endsWith('.ogg')) {
         const previewUrl = `${config.botPublicUrl}/storage/${fileName}`;
-        body += `_Please confirm to generate your professional PDF._\n\n` +
-                `📄 *Document Attached:*\n${previewUrl}`;
+        body += `📄 *${t('document_attached', state.lang)}:*\n${previewUrl}`;
       } else {
-        body += `🎙️ *Voice Note:* Processed\n\n_Please confirm the details extracted from your voice note._`;
+        body += `🎙️ *${t('voice_note', state.lang)}:* ${t('processed', state.lang)}`;
       }
     } else {
-      body += `You may upload the invoice document (PDF/Image) now to link it, or confirm to save as text-only.`;
+      body += `\n${t('prompt_upload_media_optional', state.lang)}\n`;
     }
     
     const buttons = [
-      { id: 'confirm', title: 'Confirm' },
-      { id: 'edit', title: 'Edit' }
+      { id: 'confirm', title: t('btn_confirm', state.lang) },
+      { id: 'edit', title: t('btn_edit', state.lang) },
+      { id: 'cancel', title: t('btn_cancel', state.lang) }
     ];
     return whatsappService.sendInteractiveButtons(from, body, buttons);
   }
 
   async sendStatementReviewButtons(from, monthYear) {
-    const buttons = [
-      { id: 'confirm', title: 'Confirm' },
-      { id: 'edit_month', title: 'Edit Month' },
-      { id: 'cancel', title: 'Cancel' }
-    ];
+    const state = await stateService.getUserState(from);
+    const body = `${t('stmt_review_title', state.lang)}\n\n` +
+                 `${t('stmt_review_month', state.lang)}: *${monthYear}*\n\n` +
+                 `${t('stmt_review_prompt', state.lang)}`;
 
-    await whatsappService.sendInteractiveButtons(from, 
-      `🏦 *Bank Statement Review*\n\n` +
-      `Detected Month: *${monthYear}*\n\n` +
-      `Please confirm if you want to upload this document for the specified month.`, 
-      buttons
-    );
+    const buttons = [
+      { id: 'confirm', title: t('btn_confirm', state.lang) },
+      { id: 'edit_month', title: t('btn_edit', state.lang) },
+      { id: 'cancel', title: t('btn_cancel', state.lang) }
+    ];
+    return whatsappService.sendInteractiveButtons(from, body, buttons);
   }
 
   async sendEditSelectionButtons(from, type = 'EXPENSE') {
-    const body = `Select the field you wish to modify:`;
+    const state = await stateService.getUserState(from);
+    const isInvoice = type === 'INVOICE';
+    const body = t('edit_selection_prompt', state.lang);
     let rows = [
-      { id: 'amt', title: 'Amount' },
-      { id: 'date', title: 'Date' },
-      { id: 'ent', title: type === 'INVOICE' ? 'Client' : 'Supplier' },
-      { id: 'pay', title: 'Payment Via' }
+      { id: 'amt', title: t('field_amount', state.lang) },
+      { id: 'date', title: t('field_date', state.lang) },
+      { id: 'ent', title: isInvoice ? t('field_entity_client', state.lang) : t('field_entity_supplier', state.lang) },
+      { id: 'pay', title: t('field_payment', state.lang) }
     ];
 
-    if (type !== 'INVOICE') {
-      rows.splice(3, 0, { id: 'cat', title: 'Category' });
+    if (!isInvoice) {
+      rows.splice(3, 0, { id: 'cat', title: t('field_category', state.lang) });
     }
 
-    rows.push({ id: 'desc', title: type === 'INVOICE' ? 'Notes' : 'Description' });
-    rows.push({ id: 'all', title: 'Re-submit Entry' });
+    rows.push({ id: 'desc', title: isInvoice ? t('field_notes', state.lang) : t('field_description', state.lang) });
+    rows.push({ id: 'all', title: t('btn_resubmit', state.lang) });
     
-    const sections = [{ title: "Modification Options", rows }];
-    return whatsappService.sendInteractiveList(from, body, "Options", sections);
+    const sections = [{ title: t('section_modification', state.lang), rows }];
+    return whatsappService.sendInteractiveList(from, body, t('list_trigger_options', state.lang), sections);
   }
 
   async sendPaymentMethodSelectionList(from, type = 'INVOICE') {
-    const body = `Please select the Payment Via for this ${type.toLowerCase()}:`;
-    const rows = [
-      { id: 'Cash', title: 'Cash' },
-      { id: 'Bank Transfer', title: 'Bank Transfer' },
-      { id: 'Credit/Debit Card', title: 'Credit/Debit Card' },
-      { id: 'Cheque', title: 'Cheque' },
-      { id: 'Mobile Payment', title: 'Mobile Payment' },
-      { id: 'Online Payment', title: 'Online Payment' },
-      { id: 'Direct Debit', title: 'Direct Debit' },
-      { id: 'Instant Bank Transfer', title: 'Instant Bank Transfer' },
-      { id: 'PayPal', title: 'PayPal' },
-      { id: 'Other', title: 'Other' }
-    ];
-    const sections = [{ title: "Payment Methods", rows }];
-    return whatsappService.sendInteractiveList(from, body, "Payment Via", sections);
+    const state = await stateService.getUserState(from);
+    const body = t('payment_method_prompt', state.lang);
+    
+    const enMethods = ["Cash", "Bank Transfer", "Credit/Debit Card", "Cheque", "Mobile Payment", "Online Payment", "Direct Debit", "Instant Bank Transfer", "PayPal", "Other"];
+    const frMethods = ["Espèces", "Virement Bancaire", "Carte Bancaire", "Chèque", "Paiement Mobile", "Paiement en Ligne", "Prélèvement", "Virement Instantané", "PayPal", "Autre"];
+    const methods = state.lang === 'fr' ? frMethods : enMethods; // Logic choice, not string literal
+
+    const rows = methods.map((m, i) => ({
+      id: enMethods[i], // Keep English ID for backend compatibility
+      title: m
+    }));
+    
+    const sections = [{ title: t('section_payment_methods', state.lang), rows }];
+    return whatsappService.sendInteractiveList(from, body, t('list_trigger_payment', state.lang), sections);
   }
 
   async sendClientSelectionList(from, clients) {
-    const body = `Please select the Client for this invoice:`;
+    const state = await stateService.getUserState(from);
+    const body = t('client_selection_prompt', state.lang);
     const rows = clients.slice(0, 9).map(client => ({
         id: `${client.id}`,
         title: (client.company_name || client.client_name).substring(0, 24),
-        description: `Customer ID: ${client.id}`
+        description: `${t('field_customer_id', state.lang)}: ${client.id}`
     }));
 
-    rows.push({ id: 'skip_client', title: 'Other / New Client', description: 'Type the name manually' });
+    rows.push({ id: 'skip_client', title: t('btn_new_client', state.lang), description: t('desc_new_client', state.lang) });
 
-    const sections = [{ title: "Registered Clients", rows }];
-    return whatsappService.sendInteractiveList(from, body, "Client List", sections);
+    const sections = [{ title: t('section_clients', state.lang), rows }];
+    return whatsappService.sendInteractiveList(from, body, t('list_trigger_clients', state.lang), sections);
   }
 
   async sendCategorySelectionList(from, categories) {
-    const body = `Please select the Category for this expense:`;
+    const state = await stateService.getUserState(from);
+    const body = t('category_selection_prompt', state.lang);
     const rows = categories.slice(0, 9).map(cat => ({
         id: (cat.name || cat).substring(0, 200),
         title: (cat.name || cat).substring(0, 24)
     }));
 
-    rows.push({ id: 'skip_category', title: 'Other / New Category', description: 'Type a custom category name' });
+    rows.push({ id: 'skip_category', title: t('btn_new_category', state.lang), description: t('desc_new_category', state.lang) });
 
-    const sections = [{ title: "Available Categories", rows }];
-    return whatsappService.sendInteractiveList(from, body, "Category List", sections);
+    const sections = [{ title: t('section_categories', state.lang), rows }];
+    return whatsappService.sendInteractiveList(from, body, t('list_trigger_categories', state.lang), sections);
   }
 
   async sendSupplierSelectionList(from, suppliers) {
-    const body = `Please select the Supplier for this expense:`;
+    const state = await stateService.getUserState(from);
+    const body = t('supplier_selection_prompt', state.lang);
     const rows = suppliers.slice(0, 9).map(s => ({
         id: s.name,
         title: s.name.substring(0, 24),
         description: `ID: ${s.id}`
     }));
     
-    rows.push({ id: 'skip_supplier', title: 'Other / New Supplier', description: 'Type the name manually' });
+    rows.push({ id: 'skip_supplier', title: t('btn_new_supplier', state.lang), description: t('desc_new_supplier', state.lang) });
 
-    const sections = [{ title: "Your Suppliers", rows }];
-    return whatsappService.sendInteractiveList(from, body, "Supplier List", sections);
+    const sections = [{ title: t('section_suppliers', state.lang), rows }];
+    return whatsappService.sendInteractiveList(from, body, t('list_trigger_suppliers', state.lang), sections);
   }
 
   async sendInvoiceStatusButtons(from) {
-    const body = "What is the **Current Status** of this invoice?";
+    const state = await stateService.getUserState(from);
+    const body = t('invoice_status_prompt', state.lang);
     const buttons = [
-      { id: 'issued', title: 'Issued (Unpaid)' },
-      { id: 'paid', title: 'Paid' },
-      { id: 'draft', title: 'Draft' }
+      { id: 'issued', title: t('status_issued', state.lang) },
+      { id: 'paid', title: t('status_paid', state.lang) }
     ];
     return whatsappService.sendInteractiveButtons(from, body, buttons);
   }
@@ -1741,6 +1788,7 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
    * Entry point for natural language reporting
    */
   async handleReportQuery(from, text) {
+    const state = await stateService.getUserState(from);
     const filters = await aiService.parseReportQuery(text, from);
     
     // Safety Net: If AI incorrectly matched a month as an entity name
@@ -1753,17 +1801,19 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
 
     if (!filters.entityName) {
       // General status report
-      await whatsappService.sendTextMessage(from, "Retrieving your account status summary...");
+      await whatsappService.sendTextMessage(from, t('fetching_status', state.lang));
       const stats = await laravelService.getAccountStatus(from, filters.month, filters.year);
-      const monthsLabel = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+      const monthsLabel = state.lang === 'fr' 
+        ? ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+        : ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
       let periodStr = filters.month ? `${monthsLabel[filters.month-1]} ` : "";
-      periodStr += filters.year || (filters.month ? "" : "this month");
+      periodStr += filters.year || (filters.month ? "" : t('this_month', state.lang).toLowerCase());
       
       return this.sendStatusInteractive(from, stats);
     }
 
     // Search for entity
-    await whatsappService.sendTextMessage(from, `🔍 Searching for reports on "*${filters.entityName}*"...`);
+    await whatsappService.sendTextMessage(from, t('searching_reports', state.lang, { name: filters.entityName }));
     
     const [clients, suppliers] = await Promise.all([
       laravelService.getClients(from),
@@ -1778,7 +1828,7 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
     const totalMatches = matchedClients.length + matchedSuppliers.length;
 
     if (totalMatches === 0) {
-      await whatsappService.sendTextMessage(from, `❌ I couldn't find any Client or Supplier matching "*${filters.entityName}*".\n\nPlease try again with a different name.`);
+      await whatsappService.sendTextMessage(from, t('error_no_match', state.lang, { name: filters.entityName }));
       return;
     }
 
@@ -1790,12 +1840,12 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
 
     // DISAMBIGUATION: Multiple matches found
     const combined = [
-      ...matchedClients.map(c => ({ id: `rep_c_${c.id}`, title: `Client: ${c.client_name.substring(0,12)}` })),
-      ...matchedSuppliers.map(s => ({ id: `rep_s_${s.id}`, title: `Supp: ${s.name.substring(0,13)}` }))
+      ...matchedClients.map(c => ({ id: `rep_c_${c.id}`, title: `${t('label_client', state.lang)}: ${c.client_name.substring(0,12)}` })),
+      ...matchedSuppliers.map(s => ({ id: `rep_s_${s.id}`, title: `${t('label_supplier', state.lang)}: ${s.name.substring(0,13)}` }))
     ].slice(0, 3); // Max 3 buttons
 
     await whatsappService.sendInteractiveButtons(from, 
-      `🤔 I found multiple matches for "*${filters.entityName}*". Which one did you mean?`,
+      t('disambiguation_title', state.lang, { name: filters.entityName }),
       combined
     );
     
@@ -1818,7 +1868,7 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
     const entity = entities ? entities.find(e => e.id == entityId) : null;
 
     if (!entity) {
-      await whatsappService.sendTextMessage(from, "❌ Sorry, I couldn't find that record. Please try searching for them again.");
+      await whatsappService.sendTextMessage(from, t('error_record_not_found', state.lang));
       stateService.clearUserState(from);
       return;
     }
@@ -1837,6 +1887,7 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
    * Formats and sends the actual report
    */
   async sendFilteredReport(from, entity, isClient, filters) {
+    const state = await stateService.getUserState(from);
     const queryParams = {
       month: filters.month,
       year: filters.year
@@ -1847,55 +1898,57 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
     const stats = await laravelService.getAccountStatus(from, queryParams.month, queryParams.year, queryParams.client_id, queryParams.supplier_id);
     
     if (!stats) {
-      return whatsappService.sendTextMessage(from, "❌ I'm sorry, I couldn't retrieve the report data at this moment. Please try again later.");
+      return whatsappService.sendTextMessage(from, t('auth_required', state.lang)); // Placeholder error
     }
     
     const name = isClient ? entity.client_name : entity.name;
     const icon = isClient ? '👤' : '🚚';
-    const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+    const months = state.lang === 'fr' 
+      ? ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+      : ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
     
-    let periodStr = 'All Time';
+    let periodStr = t('all_time', state.lang);
     if (filters.month || filters.year) {
       periodStr = (filters.month ? `${months[filters.month-1]} ` : "") + (filters.year || "");
     }
 
-    let report = `${icon} *Report for ${name}*\n`;
-    if (periodStr) report += `📅 *Period:* ${periodStr}\n`;
+    let report = `${icon} *${t('report_for', state.lang, { name })}*\n`;
+    if (periodStr) report += `📅 *${t('field_period', state.lang)}:* ${periodStr}\n`;
     report += `--- \n\n`;
 
     if (isClient) {
       // --- CLIENT VIEW (SALES) ---
-      report += `💰 *Revenue:* ${(stats.salesSum || 0).toFixed(2)}\n`;
-      report += `🕒 *Outstanding:* ${(stats.total_unpaid_sum || 0).toFixed(2)}\n`;
-      report += `📈 *Quotes:* ${(stats.total_quote_sum || 0).toFixed(2)}\n`;
-      report += `🏛️ *VAT Collected:* ${(stats.cash_vat_sum || 0).toFixed(2)}\n`;
+      report += `💰 *${t('field_revenue', state.lang)}:* ${(stats.salesSum || 0).toFixed(2)}\n`;
+      report += `🕒 *${t('field_outstanding', state.lang)}:* ${(stats.total_unpaid_sum || 0).toFixed(2)}\n`;
+      report += `📈 *${t('field_quotes', state.lang)}:* ${(stats.total_quote_sum || 0).toFixed(2)}\n`;
+      report += `🏛️ *${t('field_vat_collected', state.lang)}:* ${(stats.cash_vat_sum || 0).toFixed(2)}\n`;
     } else {
       // --- SUPPLIER VIEW (PURCHASES) ---
-      report += `💸 *Total Expenses:* ${(stats.expensesSum || 0).toFixed(2)}\n`;
-      report += `🏷️ *VAT Paid:* ${(stats.expenseVat || 0).toFixed(2)}\n`;
-      report += `📋 *Records:* ${stats.expensesCount || 0} expenses\n`;
+      report += `💸 *${t('field_revenue', state.lang)}:* ${(stats.expensesSum || 0).toFixed(2)}\n`;
+      report += `🏷️ *${t('field_vat_paid', state.lang)}:* ${(stats.expenseVat || 0).toFixed(2)}\n`;
+      report += `📋 *${t('field_records', state.lang)}:* ${stats.expensesCount || 0}\n`;
     }
 
-    report += `\n_You can view the full transaction history for this filter in your portal._`;
+    report += `\n${t('portal_full_history', state.lang)}`;
 
     const monthPad = filters.month ? String(filters.month).padStart(2, '0') : '00';
     const yearPad = filters.year ? String(filters.year) : '0000';
     const listAction = isClient ? 'list_inv' : 'list_exp';
     const listButtonId = `${listAction}_${entity.id}_${monthPad}_${yearPad}`;
-    const listButtonTitle = isClient ? '📄 List Invoices' : '📄 List Expenses';
+    const listButtonTitle = isClient ? t('btn_list_invoices', state.lang) : t('btn_list_expenses', state.lang);
 
     const recExpId = `record_exp_${entity.id}`;
     const recInvId = `record_inv_${entity.id}`;
 
     const buttons = [
-      { id: listButtonId, title: listButtonTitle },
-      { id: 'action_status', title: '📊 Status' }
+      { id: listButtonId, title: listButtonTitle }
     ];
+    buttons.push({ id: 'action_status', title: t('btn_status', state.lang) });
 
     if (isClient) {
-      buttons.push({ id: recInvId, title: '✍️ Record Invoice' });
+      buttons.push({ id: recInvId, title: t('btn_record_invoice', state.lang) });
     } else {
-      buttons.push({ id: recExpId, title: '✍️ Record Expense' });
+      buttons.push({ id: recExpId, title: t('btn_record_expense', state.lang) });
     }
 
     await whatsappService.sendInteractiveButtons(from, report, buttons);
@@ -1905,6 +1958,7 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
    * Drill-down handler for specific transaction lists
    */
   async handleListTransactions(from, type, entityId, month, year) {
+    const state = await stateService.getUserState(from);
     try {
       // 1. Fetch data
       let transactions = [];
@@ -1912,24 +1966,26 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
 
       if (type === 'inv') {
         transactions = await laravelService.getInvoices(from, null, month, year, entityId);
-        title = "📑 Recent Invoices";
+        title = t('recent_invoices', state.lang);
       } else {
         transactions = await laravelService.getExpenses(from, month, year, entityId);
-        title = "💸 Recent Expenses";
+        title = t('recent_expenses', state.lang);
       }
 
       if (transactions.length === 0) {
-        return whatsappService.sendTextMessage(from, `ℹ️ No transactions found for this period.`);
+        return whatsappService.sendTextMessage(from, t('no_transactions_found', state.lang));
       }
 
-      // 2. Format list (Calculate total for ALL, but show only Top 10)
-      const months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-      const periodStr = month ? `${months[month-1]} ${year || ''}` : (year ? year : "All Time");
+      // 2. Format list
+      const months = state.lang === 'fr' 
+        ? ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+        : ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+      
+      const periodStr = month ? `${months[month-1]} ${year || ''}` : (year ? year : t('all_time', state.lang));
       
       let totalSum = 0;
       let currency = 'MAD';
 
-      // 1. Calculate TOTAL for everything found
       transactions.forEach(t => {
           let amount = 0;
           if (type === 'inv') {
@@ -1941,9 +1997,8 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
           if (t.currency) currency = t.currency;
       });
 
-      // 2. Build rows for only Top 10 (WhatsApp Limit)
       const rows = transactions.slice(0, 10).map((t) => {
-        const date = t.date ? new Date(t.date).toLocaleDateString('en-GB') : 'N/A';
+        const date = t.date ? new Date(t.date).toLocaleDateString(state.lang === 'fr' ? 'fr-FR' : 'en-GB') : 'N/A';
         
         let amount = 0;
         if (type === 'inv') {
@@ -1952,39 +2007,40 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
           amount = parseFloat(t.total_ttc || t.ttc || 0);
         }
 
-        const fmtAmount = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + (t.currency || currency);
+        const fmtAmount = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + (t.currency || currency);
         const prefix = type === 'inv' ? 'v_inv_' : 'v_exp_';
 
         return {
            id: `${prefix}${t.id}`,
            title: `${date} — ${fmtAmount}`,
-           description: t.notes || (type === 'inv' ? `Invoice #${t.id}` : `Expense #${t.id}`)
+           description: t.notes || (type === 'inv' ? `${t('field_invoice_num', state.lang)} #${t.id}` : `${t('field_expense_num', state.lang)} #${t.id}`)
         };
       });
 
-      const fmtTotal = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2 }).format(totalSum) + ' ' + currency;
+      const fmtTotal = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(totalSum) + ' ' + currency;
       
       const bodyText = `*${title}*\n` +
-                       `📅 *Period:* ${periodStr}\n` +
+                       `📅 *${t('field_period', state.lang)}:* ${periodStr}\n` +
                        `💰 *Total:* ${fmtTotal}\n\n` +
-                       `I found ${transactions.length} records. Tap below to view or download a specific document:`;
+                       t('records_found_msg', state.lang, { count: transactions.length });
 
       const sections = [{
-          title: "Select Document",
+          title: t('select_document', state.lang),
           rows: rows
       }];
 
-      await whatsappService.sendInteractiveList(from, bodyText, "View Documents", sections);
+      await whatsappService.sendInteractiveList(from, bodyText, t('view_documents', state.lang), sections);
 
     } catch (error) {
       console.error('handleListTransactions error:', error);
-      await whatsappService.sendTextMessage(from, "❌ Sorry, I encountered an error while fetching the transaction list.");
+      await whatsappService.sendTextMessage(from, t('error_fetching_transactions', state.lang));
     }
   }
   /**
    * Fetch and deliver a specific invoice or expense document natively
    */
   async handleDeliverSpecificMedia(from, type, id) {
+    const state = await stateService.getUserState(from);
     try {
       let document = null;
       let label = "";
@@ -2000,7 +2056,7 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
       }
 
       if (!document || !document.download_url) {
-        return whatsappService.sendTextMessage(from, `❌ Sorry, I couldn't find the original file for ${label} #${id}.`);
+        return whatsappService.sendTextMessage(from, t('error_media_delivery', state.lang, { label, id }));
       }
 
       const date = document.date ? new Date(document.date).toLocaleDateString('en-GB') : 'N/A';
@@ -2015,16 +2071,17 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
       const currency = document.currency || 'MAD';
       const fmtAmount = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + currency;
       const entityName = type === 'inv' ? (document.client?.client_name || 'N/A') : (document.supplier?.supplier_name || 'N/A');
-      const entityLabel = type === 'inv' ? 'Client' : 'Supplier';
+      const entityLabelText = type === 'inv' ? t('label_client', state.lang) : t('label_supplier', state.lang);
+      const notesText = document.notes || document.description || 'N/A';
 
-      const successText = `🧾 *${label.toUpperCase()} DOCUMENT*\n` +
+      const successText = `🧾 *${t('media_doc_title', state.lang, { label: label.toUpperCase() })}*\n` +
                           `━━━━━━━━━━━━━━━━━━\n` +
-                          `🏢 *${entityLabel}:* ${entityName}\n` +
-                          `💰 *Amount:* ${fmtAmount}\n` +
-                          `📅 *Date:* ${date}\n` +
-                          `📝 *Notes:* ${document.notes || document.description || 'N/A'}\n` +
+                          `🏢 *${entityLabelText}:* ${entityName}\n` +
+                          `💰 *${t('field_amount', state.lang)}:* ${fmtAmount}\n` +
+                          `📅 *${t('field_date', state.lang)}:* ${date}\n` +
+                          `📝 *${t('field_notes', state.lang)}:* ${notesText}\n` +
                           `━━━━━━━━━━━━━━━━━━\n` +
-                          `✅ *Status:* ${document.status || 'Recorded'}`;
+                          `✅ *Status:* ${document.status || t('recorded_successfully_short', state.lang)}`;
       
       const isPdfRoute = document.download_url.includes('/pdf');
       const isImage = document.document_path && (
@@ -2036,12 +2093,13 @@ console.log(data,  "kjlkjlkjlkjlkjlkj")
       if (!isPdfRoute && isImage) {
           await whatsappService.sendImage(from, document.download_url, successText);
       } else {
-          await whatsappService.sendDocument(from, document.download_url, `${label}_${id}.pdf`, successText);
+          const extension = document.document_path ? path.extname(document.document_path) : '.pdf';
+          await whatsappService.sendDocument(from, document.download_url, `${label}_${id}${extension}`, successText);
       }
 
     } catch (error) {
       console.error('handleDeliverSpecificMedia error:', error);
-      await whatsappService.sendTextMessage(from, "❌ Sorry, I encountered an error while delivering that document.");
+      await whatsappService.sendTextMessage(from, t('error_lost_track', state.lang)); // Generic error fallback
     }
   }
 }

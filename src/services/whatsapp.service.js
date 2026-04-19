@@ -1,5 +1,7 @@
 const axios = require('axios');
 const config = require('../config');
+const logger = require('../utils/logger');
+
 
 class WhatsAppService {
   constructor() {
@@ -33,7 +35,9 @@ class WhatsAppService {
     };
 
     try {
+      logger.debug(`[OUTBOUND TEMPLATE to ${to}]: ${templateName}`);
       const response = await axios.post(url, payload, {
+
         headers: {
           'Authorization': `Bearer ${this.accessToken}`,
           'Content-Type': 'application/json'
@@ -41,7 +45,6 @@ class WhatsAppService {
       });
       return response.data;
     } catch (error) {
-      console.error('WhatsApp API Error:', error.response ? error.response.data : error.message);
       throw error;
     }
   }
@@ -71,7 +74,9 @@ class WhatsAppService {
               'Content-Type': 'application/json'
           }
       });
+      logger.debug(`[OUTBOUND TEXT to ${to}]: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
       return response.data;
+
   }
 
   /**
@@ -95,7 +100,7 @@ class WhatsAppService {
             type: 'reply',
             reply: {
               id: btn.id,
-              title: btn.title
+              title: btn.title.length > 20 ? btn.title.substring(0, 17) + '...' : btn.title
             }
           }))
         }
@@ -103,7 +108,9 @@ class WhatsAppService {
     };
 
     try {
+      logger.debug(`[OUTBOUND BUTTONS to ${to}]: ${buttons.length} buttons`);
       const response = await axios.post(url, payload, {
+
         headers: {
           'Authorization': `Bearer ${this.accessToken}`,
           'Content-Type': 'application/json'
@@ -111,7 +118,6 @@ class WhatsAppService {
       });
       return response.data;
     } catch (error) {
-      console.error('WhatsApp Interactive Button Error:', error.response ? error.response.data : error.message);
       throw error;
     }
   }
@@ -125,6 +131,17 @@ class WhatsAppService {
    */
   async sendInteractiveList(to, bodyText, buttonText, sections) {
     const url = `${this.baseUrl}/${this.phoneNumberId}/messages`;
+    
+    // Sanitize sections to adhere to WhatsApp limits
+    const sanitizedSections = sections.map(section => ({
+      title: section.title ? (section.title.length > 24 ? section.title.substring(0, 21) + '...' : section.title) : undefined,
+      rows: section.rows.map(row => ({
+        id: row.id,
+        title: row.title.length > 24 ? row.title.substring(0, 21) + '...' : row.title,
+        description: row.description ? (row.description.length > 72 ? row.description.substring(0, 69) + '...' : row.description) : undefined
+      }))
+    }));
+
     const payload = {
       messaging_product: 'whatsapp',
       recipient_type: 'individual',
@@ -134,14 +151,16 @@ class WhatsAppService {
         type: 'list',
         body: { text: bodyText },
         action: {
-          button: buttonText,
-          sections: sections
+          button: buttonText.length > 20 ? buttonText.substring(0, 17) + '...' : buttonText,
+          sections: sanitizedSections
         }
       }
     };
 
     try {
+      logger.debug(`[OUTBOUND LIST to ${to}]: "${buttonText}"`);
       const response = await axios.post(url, payload, {
+
         headers: {
           'Authorization': `Bearer ${this.accessToken}`,
           'Content-Type': 'application/json'
@@ -149,7 +168,6 @@ class WhatsAppService {
       });
       return response.data;
     } catch (error) {
-      console.error('WhatsApp Interactive List Error:', error.response ? error.response.data : error.message);
       throw error;
     }
   }
@@ -179,7 +197,9 @@ class WhatsAppService {
     }
 
     try {
+      logger.debug(`[OUTBOUND DOCUMENT to ${to}]: ${filename}`);
       const response = await axios.post(apiURL, payload, {
+
         headers: {
           'Authorization': `Bearer ${this.accessToken}`,
           'Content-Type': 'application/json'
@@ -187,7 +207,6 @@ class WhatsAppService {
       });
       return response.data;
     } catch (error) {
-      console.error('WhatsApp Send Document Error:', error.response ? error.response.data : error.message);
       throw error;
     }
   }
@@ -215,7 +234,9 @@ class WhatsAppService {
     }
 
     try {
+      logger.debug(`[OUTBOUND IMAGE to ${to}]`);
       const response = await axios.post(apiURL, payload, {
+
         headers: {
           'Authorization': `Bearer ${this.accessToken}`,
           'Content-Type': 'application/json'
@@ -223,7 +244,6 @@ class WhatsAppService {
       });
       return response.data;
     } catch (error) {
-      console.error('WhatsApp Send Image Error:', error.response ? error.response.data : error.message);
       throw error;
     }
   }

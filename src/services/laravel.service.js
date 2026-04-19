@@ -1,4 +1,6 @@
 const axios = require('axios');
+const logger = require('../utils/logger');
+
 
 class LaravelService {
   constructor() {
@@ -142,6 +144,80 @@ class LaravelService {
     }
   }
 
+  /**
+   * Fetches dashboard data and formats it for the bot
+   */
+  async getReportingData(phone, month = null, year = null, lang = 'en') {
+    try {
+      const params = {};
+      if (month && year) {
+        params.date_from = `${year}-${month}-01`;
+        params.date_to = new Date(year, month, 0).toISOString().split('T')[0];
+      }
+      
+      const response = await axios.get(`${this.baseUrl}/customer/dashboard-data`, {
+        params,
+        headers: this.getBotHeaders(phone)
+      });
+
+      const data = response.data.data || {};
+      const currentYear = year || new Date().getFullYear();
+      const monthNum = month || String(new Date().getMonth() + 1).padStart(2, '0');
+      
+      // Calculate localized month name
+      const dateObj = new Date(currentYear, parseInt(monthNum) - 1, 1);
+      const localizedMonth = dateObj.toLocaleString(lang === 'fr' ? 'fr-FR' : 'en-US', { month: 'long', year: 'numeric' });
+
+      return {
+        month: localizedMonth,
+        totalDocuments: (parseInt(data.total_issued_count) || 0) + (parseInt(data.total_paid_count) || 0) + (parseInt(data.total_expenses_count) || 0),
+        invoicesCount: (parseInt(data.total_issued_count) || 0) + (parseInt(data.total_paid_count) || 0),
+        expensesCount: parseInt(data.total_expenses_count) || 0,
+
+        // Core Financials
+        salesSum: parseFloat(data.total_issued_paid_sum) || 0,
+        cash_revenue_sum: parseFloat(data.total_paid_sum) || 0,
+        total_unpaid_sum: parseFloat(data.unpaidInvoiceSum) || 0,
+        total_quote_sum: parseFloat(data.total_quote_sum) || 0,
+        cash_vat_sum: parseFloat(data.total_vat_payable) || 0,
+        total_paid_sum: parseFloat(data.total_paid_sum) || 0,
+        
+        pendingReviewCount: parseInt(data.total_pending_review_count) || 0,
+        statementsCount: parseInt(data.bank_statements_count) || 0,
+        
+        expensesSum: parseFloat(data.total_expenses_sum) || 0,
+        total_expenses_sum: parseFloat(data.total_expenses_sum) || 0,
+        expenseVat: parseFloat(data.total_expenses_vat) || 0,
+        vatPayable: parseFloat(data.total_vat_payable) || 0,
+        recentDocuments: [],
+        targetMonth: monthNum,
+        targetYear: currentYear
+      };
+    } catch (error) {
+      console.error('Laravel Hybrid Status Error:', error.response?.data || error.message);
+      const currentYear = new Date().getFullYear();
+      const localizedMonth = new Date().toLocaleString(lang === 'fr' ? 'fr-FR' : 'en-US', { month: 'long', year: 'numeric' });
+      
+      return { 
+        month: localizedMonth,
+        targetMonth: String(new Date().getMonth() + 1).padStart(2, '0'),
+        targetYear: currentYear,
+        status: 'Error fetching data',
+        documentsReceived: 0,
+        salesSum: 0,
+        cash_revenue_sum: 0,
+        total_unpaid_sum: 0,
+        total_quote_sum: 0,
+        cash_vat_sum: 0,
+        expensesSum: 0,
+        total_expenses_sum: 0,
+        expenseVat: 0,
+        vatPayable: 0,
+        recentDocuments: []
+      };
+    }
+  }
+
   async getInvoices(phone, status = null, month = null, year = null, clientId = null, id = null) {
     try {
       const response = await axios.get(`${this.baseUrl}/customer/customer-invoices`, {
@@ -191,7 +267,7 @@ class LaravelService {
    * Create an expense via standard Customer API
    */
   async createExpense(data, filePath = null, phone = null) {
-    console.log(`📝 Syncing Expense for ${phone} (Hybrid Mode)...`);
+    logger.debug(`📝 Syncing Expense for ${phone} (Hybrid Mode)...`);
     try {
       const FormData = require('form-data');
       const fs = require('fs');
@@ -212,8 +288,6 @@ class LaravelService {
         
         if (isSupported) {
           form.append('file', fs.createReadStream(filePath));
-        } else {
-          console.log(`📎 [INFO] Skipping non-image attachment for Laravel API: ${filePath}`);
         }
       }
 
@@ -234,7 +308,7 @@ class LaravelService {
    * Upload bank statement via standard Customer API
    */
   async uploadStatement(filePath, phone, monthYear) {
-      console.log(`📄 Uploading Bank Statement for ${phone} (${monthYear})...`);
+      logger.debug(`📄 Uploading Bank Statement for ${phone} (${monthYear})...`);
       try {
           const FormData = require('form-data');
           const fs = require('fs');
@@ -262,7 +336,7 @@ class LaravelService {
    * Create a Customer Invoice via standard Customer API
    */
   async createInvoice(data, filePath, phone) {
-      console.log(`🧾 Syncing Customer Invoice for ${phone} (Hybrid Mode)...`);
+      logger.debug(`🧾 Syncing Customer Invoice for ${phone} (Hybrid Mode)...`);
       try {
           const FormData = require('form-data');
           const fs = require('fs');
@@ -302,8 +376,6 @@ class LaravelService {
               
               if (isSupported) {
                   form.append('document', fs.createReadStream(filePath));
-              } else {
-                  console.log(`📎 [INFO] Skipping non-image/PDF invoice attachment for Laravel API: ${filePath}`);
               }
           }
 
@@ -324,7 +396,7 @@ class LaravelService {
    * Get Customer Clients for Interactive List
    */
   async getClients(phone) {
-      console.log(`👥 Fetching Clients for ${phone}...`);
+      logger.debug(`👥 Fetching Clients for ${phone}...`);
       try {
       const response = await axios.get(`${this.baseUrl}/customer/customer-clients?sort=recent`, {
         timeout: 15000,
@@ -341,7 +413,7 @@ class LaravelService {
    * Get Category List for AI Context
    */
   async getCategories(phone = null) {
-      console.log(`📂 Fetching Categories for AI Context...`);
+      logger.debug(`📂 Fetching Categories for AI Context...`);
       try {
       const response = await axios.get(`${this.baseUrl}/customer/transaction-resources`, {
         headers: this.getBotHeaders(phone)
@@ -357,7 +429,7 @@ class LaravelService {
    * Get Supplier List for Interactive Selection
    */
   async getSuppliers(phone) {
-      console.log(`🚚 Fetching Suppliers for ${phone}...`);
+      logger.debug(`🚚 Fetching Suppliers for ${phone}...`);
       try {
       const response = await axios.get(`${this.baseUrl}/customer/transaction-resources?sort=recent`, {
         headers: this.getBotHeaders(phone)

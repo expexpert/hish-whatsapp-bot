@@ -20,13 +20,28 @@ const handleProxy = async (req, res, next) => {
         const response = await axios({
             method: 'GET',
             url: targetUrl,
-            headers: { ...req.headers }, // Forward original headers
+            headers: { 
+                ...req.headers,
+                'ngrok-skip-browser-warning': 'true', 
+                'X-Forwarded-Host': req.headers.host,
+                'X-Forwarded-Proto': req.headers['x-forwarded-proto'] || 'https'
+            },
             responseType: 'stream',
             validateStatus: false
         });
-        res.set(response.headers);
+
+        // Remove security-sensitive headers 
+        const headers = { ...response.headers };
+        delete headers['set-cookie'];
+        
+        // Ensure critical media headers are passed to Meta
+        if (response.headers['content-type']) res.set('Content-Type', response.headers['content-type']);
+        if (response.headers['content-length']) res.set('Content-Length', response.headers['content-length']);
+        
+        res.set(headers);
         response.data.pipe(res);
     } catch (err) {
+        console.error('[PROXY ERROR]:', err.message);
         next();
     }
 };

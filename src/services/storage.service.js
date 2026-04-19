@@ -13,22 +13,29 @@ class StorageService {
 
     const filePath = path.join(storageDir, fileName);
 
-    // 1. Get the Download URL from Meta
-    const urlResponse = await axios.get(`${config.whatsapp.baseUrl}/${mediaId}`, {
-      headers: { 'Authorization': `Bearer ${config.whatsapp.accessToken}` }
-    });
-    
-    const downloadUrl = urlResponse.data.url;
+    try {
+      // 1. Get the Download URL from Meta
+      const urlResponse = await axios.get(`${config.whatsapp.baseUrl}/${mediaId}`, {
+        headers: { 'Authorization': `Bearer ${config.whatsapp.accessToken}` }
+      });
+      
+      const downloadUrl = urlResponse.data.url;
+      if (!downloadUrl) throw new Error("Meta API did not return a download URL");
 
-    // 2. Download the binary content
-    const fileResponse = await axios.get(downloadUrl, {
-      responseType: 'arraybuffer',
-      headers: { 'Authorization': `Bearer ${config.whatsapp.accessToken}` }
-    });
+      // 2. Download the binary content
+      const fileResponse = await axios.get(downloadUrl, {
+        responseType: 'arraybuffer',
+        headers: { 'Authorization': `Bearer ${config.whatsapp.accessToken}` }
+      });
 
-    // 3. Save to file
-    fs.writeFileSync(filePath, fileResponse.data);
-    return filePath;
+      // 3. Save to file
+      fs.writeFileSync(filePath, fileResponse.data);
+      return filePath;
+    } catch (error) {
+      const errorMsg = error.response?.data?.error?.message || error.message;
+      console.error(`❌ [StorageService] Failed to download media ${mediaId}:`, errorMsg);
+      throw new Error(`Media download failed: ${errorMsg}`);
+    }
   }
 }
 

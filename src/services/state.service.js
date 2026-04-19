@@ -7,15 +7,23 @@ const authCache = new Map();
  */
 class StateService {
   setUserState(phoneNumber, state, data = {}) {
-    userStates.set(phoneNumber, { state, data });
+    const currentState = this.getUserState(phoneNumber);
+    userStates.set(phoneNumber, { state, data, lang: currentState.lang || 'en' });
   }
 
   getUserState(phoneNumber) {
-    return userStates.get(phoneNumber) || { state: 'IDLE', data: {} };
+    return userStates.get(phoneNumber) || { state: 'IDLE', data: {}, lang: 'en' };
+  }
+
+  setLanguage(phoneNumber, lang) {
+    const state = this.getUserState(phoneNumber);
+    state.lang = lang;
+    userStates.set(phoneNumber, state);
   }
 
   clearUserState(phoneNumber) {
-    userStates.delete(phoneNumber);
+    const currentState = this.getUserState(phoneNumber);
+    userStates.set(phoneNumber, { state: 'IDLE', data: {}, lang: currentState.lang || 'en' });
   }
 
   // --- Auth Cache (Solves Rate Limiting) ---
