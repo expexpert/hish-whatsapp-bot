@@ -140,7 +140,7 @@ class WhatsAppController {
         try {
           const extension = 'ogg';
           audioPath = await storageService.downloadMedia(message.audio.id, `audio_${Date.now()}.${extension}`);
-          const transcription = await aiService.transcribeVoice(audioPath, from);
+          const transcription = await aiService.transcribeVoice(audioPath, from, false, state.lang);
           
           if (transcription) {
             text = transcription.trim();

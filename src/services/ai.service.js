@@ -209,28 +209,31 @@ class AIService {
   /**
    * VOICE TRANSCRIPTION: Real Whisper vs. Mock Fallback
    */
-  async transcribeVoice(localFilePath, phone = null, skipCooldown = false) {
-    if (this.openai && phone) {
-      const status = await laravelService.checkAiStatus(phone, skipCooldown);
-      if (!status.allowed) {
-        throw new Error(status.message || "AI quota exceeded.");
-      }
-      return this.transcribeWithWhisper(localFilePath, phone, skipCooldown);
-    }
+   async transcribeVoice(localFilePath, phone = null, skipCooldown = false, forcedLanguage = 'en') {
+     if (this.openai && phone) {
+       const status = await laravelService.checkAiStatus(phone, skipCooldown);
+       if (!status.allowed) {
+         throw new Error(status.message || "AI quota exceeded.");
+       }
+       return this.transcribeWithWhisper(localFilePath, phone, skipCooldown, forcedLanguage);
+     }
+
     return this.mockTranscription(localFilePath);
   }
 
   /**
    * ADVANCED: OpenAI Whisper
    */
-  async transcribeWithWhisper(localFilePath, phone = null, skipCooldown = false) {
+  async transcribeWithWhisper(localFilePath, phone = null, skipCooldown = false, forcedLanguage = 'en') {
     // Whisper Transcription logic...
     try {
       const transcription = await this.openai.audio.transcriptions.create({
         file: fs.createReadStream(localFilePath),
         model: "whisper-1",
-        response_format: "verbose_json"
+        response_format: "verbose_json",
+        language: forcedLanguage
       });
+
 
       // Log usage (Whisper doesn't return tokens, we use duration or fixed cost)
       if (phone) {
