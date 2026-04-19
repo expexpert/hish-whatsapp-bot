@@ -17,6 +17,37 @@ class WhatsAppController {
     // Periodically clear old IDs to prevent memory leak
     setInterval(() => this.processedMessageIds.clear(), 3600000); // Every hour
   }
+
+  /**
+   * String similarity helper (Dice's Coefficient / Bigram)
+   * Returns a score between 0.0 and 1.0
+   */
+  calculateSimilarity(str1, str2) {
+      if (!str1 || !str2) return 0;
+      const s1 = str1.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const s2 = str2.toLowerCase().replace(/[^a-z0-9]/g, '');
+      
+      if (s1 === s2) return 1.0;
+      if (s1.length < 2 || s2.length < 2) return s1 === s2 ? 1.0 : 0;
+      
+      const getBigrams = (s) => {
+          const bigrams = new Set();
+          for (let i = 0; i < s.length - 1; i++) {
+              bigrams.add(s.substring(i, i + 2));
+          }
+          return bigrams;
+      };
+      
+      const b1 = getBigrams(s1);
+      const b2 = getBigrams(s2);
+      
+      let intersect = 0;
+      for (const b of b1) {
+          if (b2.has(b)) intersect++;
+      }
+      
+      return (2.0 * intersect) / (b1.size + b2.size);
+  }
   
   async verifyWebhook(req, res) {
     const mode = req.query['hub.mode'];
@@ -1820,10 +1851,44 @@ class WhatsAppController {
       laravelService.getSuppliers(from)
     ]);
 
-    // Sanitize search: remove trailing punctuation and trim
+    // 1. Strict Pass (Substring match)
     const search = filters.entityName.toLowerCase().replace(/[.,!?;:]+$/, "").trim();
-    const matchedClients = (clients || []).filter(c => c.client_name.toLowerCase().includes(search));
-    const matchedSuppliers = (suppliers || []).filter(s => s.name.toLowerCase().includes(search));
+    let matchedClients = (clients || []).filter(c => c.client_name.toLowerCase().includes(search));
+    let matchedSuppliers = (suppliers || []).filter(s => s.name.toLowerCase().includes(search));
+
+    // 2. Fuzzy Fallback (If no strict matches found)
+    if (matchedClients.length === 0 && matchedSuppliers.length === 0) {
+        logger.debug(`⚠️ No strict match for "${search}". Running fuzzy search...`);
+        const threshold = 0.45; // 45% similarity for names is usually safe
+        
+        const fuzzyClients = (clients || [])
+            .map(c => ({ ...c, score: this.calculateSimilarity(search, c.client_name) }))
+            .filter(c => c.score >= threshold)
+            .sort((a, b) => b.score - a.score);
+
+        const fuzzySuppliers = (suppliers || [])
+            .map(s => ({ ...s, score: this.calculateSimilarity(search, s.name) }))
+            .filter(s => s.score >= threshold)
+            .sort((a, b) => b.score - a.score);
+
+        // If we found any fuzzy matches, use them
+        if (fuzzyClients.length > 0 || fuzzySuppliers.length > 0) {
+            // If the top score is high (e.g. > 70%), just take the top matches
+            const topScore = Math.max(
+                fuzzyClients[0]?.score || 0, 
+                fuzzySuppliers[0]?.score || 0
+            );
+
+            if (topScore > 0.7) {
+                matchedClients = fuzzyClients.filter(c => c.score === topScore);
+                matchedSuppliers = fuzzySuppliers.filter(s => s.score === topScore);
+            } else {
+                // If fuzzy but lower confidence, include all that passed the threshold for disambiguation
+                matchedClients = fuzzyClients;
+                matchedSuppliers = fuzzySuppliers;
+            }
+        }
+    }
 
     const totalMatches = matchedClients.length + matchedSuppliers.length;
 
