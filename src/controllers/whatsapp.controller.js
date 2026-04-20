@@ -1029,9 +1029,9 @@ class WhatsAppController {
    * Centralizes routing for all document types (text or media)
    */
   async handleDocumentRouting(from, data, filePath, type) {
-    const currentState = await stateService.getUserState(from);
-    logger.debug(`[DEBUG] ROUTING START - State: ${currentState?.state}`);
-    const existingData = (currentState && currentState.data) ? (currentState.data.expenseData || currentState.data.invoiceData || {}) : {};
+    const state = await stateService.getUserState(from);
+    logger.debug(`[DEBUG] ROUTING START - State: ${state?.state}`);
+    const existingData = (state && state.data) ? (state.data.expenseData || state.data.invoiceData || {}) : {};
     logger.debug(`[DEBUG] Existing Data:`, existingData);
     const today = new Date().toISOString().split('T')[0];
     const invalidVals = ['unknown', 'general', 'n/a', 'none', 'null', 'undefined', ''];
@@ -1068,7 +1068,7 @@ class WhatsAppController {
     }
 
     // --- 2. SMART MERGE (Priority: New > Old) ---
-    const isCapturing = currentState && currentState.state !== 'IDLE';
+    const isCapturing = state && state.state !== 'IDLE';
     if (isCapturing) {
 
         const invalidVals = ['unknown', 'general', 'n/a', 'none', 'null', 'undefined', ''];
@@ -1160,7 +1160,7 @@ class WhatsAppController {
         }
         
         // STRICTLY preserve original type and data during an active session
-        if (currentState.state.includes('EXPENSE')) {
+        if (state.state.includes('EXPENSE')) {
             mergedData.documentType = 'EXPENSE';
 
             const newEntityName = mergedData.entity;
@@ -1182,14 +1182,14 @@ class WhatsAppController {
                 mergedData.supplier_id = existingData.supplier_id;
                 mergedData.entity = existingData.entity;
             }
-        } else if (currentState.state.includes('INVOICE')) {
+        } else if (state.state.includes('INVOICE')) {
             mergedData.documentType = 'INVOICE';
             if (existingData.client_id && (!mergedData.client_name || invalidVals.includes(mergedData.client_name.toLowerCase()))) {
                 mergedData.client_id = existingData.client_id;
             }
-        } else if (currentState.state.includes('STATEMENT')) {
+        } else if (state.state.includes('STATEMENT')) {
             mergedData.documentType = 'STATEMENT';
-            if (currentState.data.monthYear) mergedData.monthYear = currentState.data.monthYear;
+            if (state.data.monthYear) mergedData.monthYear = state.data.monthYear;
         }
     }
 
@@ -1235,7 +1235,7 @@ class WhatsAppController {
     }
 
     if (mergedData.documentType === 'STATEMENT') {
-        const monthYear = mergedData.monthYear || (isCapturing && currentState.data?.monthYear);
+        const monthYear = mergedData.monthYear || (isCapturing && state.data?.monthYear);
 
         if (monthYear && filePath && type !== 'audio') {
             stateService.setUserState(from, 'AWAITING_STATEMENT_CONFIRMATION', { filePath, monthYear });
@@ -1344,9 +1344,9 @@ class WhatsAppController {
             }
         } else if (type !== 'status') {
             // Re-prompt instead of Menu if we are in a dedicated flow
-            const isCapturing = currentState && currentState.state !== 'IDLE';
+            const isCapturing = state && state.state !== 'IDLE';
             if (isCapturing) {
-                const flowName = currentState.state.includes('INVOICE') ? 'invoice' : 'expense';
+                const flowName = state.state.includes('INVOICE') ? 'invoice' : 'expense';
                 await whatsappService.sendTextMessage(from, `🤔 I'm sorry, I couldn't find an amount or valid details in that ${type}. \n\nPlease try again or provide a document for this ${flowName}.`);
             } else {
                 await this.sendWelcomeMenu(from);
