@@ -268,27 +268,47 @@ class WhatsAppController {
         // --- NEW: AI INTENT & LANGUAGE SENSING ---
         // Triggered for natural language sentences to detect intent and language
         if ((!detectedIntent || text.split(' ').length > 2) && !isCoreFrenchAction && (type === 'text' || type === 'audio') && state.state === 'IDLE') {
-            const greetings = ['hi', 'hello', 'hey', 'bonjour', 'salam', 'ola', 'ça va', 'ca va'];
+            const greetings = ['hi', 'hello', 'hey', 'bonjour', 'salam', 'ola', 'ça va', 'ca va', 'salut', 'coucou'];
             if (!greetings.includes(textLower)) {
                 // Returns { intent, lang }
                 const aiResult = await aiService.classifyIntent(text, from, true);
                 
-                // --- UPDATE LANGUAGE ---
-                if (aiResult.lang && aiResult.lang !== state.lang) {
+                // --- UPDATE LANGUAGE (with Safety Check) ---
+                if (aiResult && aiResult.lang && aiResult.lang !== state.lang) {
                     stateService.setLanguage(from, aiResult.lang);
                     state.lang = aiResult.lang; // Update local reference
                 }
 
                 // If keywords didn't find anything, let AI set the intent
-                if (!detectedIntent && aiResult.intent && aiResult.intent !== 'UNKNOWN' && aiResult.intent !== 'MENU') {
+                if (aiResult && !detectedIntent && aiResult.intent && aiResult.intent !== 'UNKNOWN' && aiResult.intent !== 'MENU') {
                     detectedIntent = aiResult.intent.toLowerCase();
                     logger.debug(`🤖 AI SENSING OVERRIDE: -> ${detectedIntent}`);
                 }
-            } else {
-                // Greetings trigger welcome menu in current language
-                if (textLower === 'bonjour' || textLower === 'ça va' || textLower === 'ca va') {
+            }
+        }
+
+        // --- MANUAL LANGUAGE SWITCHING FOR SHORT COMMANDS ---
+        // If the message is short and explicitly French, switch language immediately (Only when IDLE).
+        // Uses normalization to ignore accents (e.g., 'etat' will match 'état')
+        const frenchKeywords = ['bonjour', 'salut', 'coucou', 'statut', 'solde', 'tableau', 'compte', 'début', 'annuler', 'état', 'facture', 'dépense', 'rapport', 'résumé'];
+        if (state.state === 'IDLE') {
+            const normalizedText = textLower.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+            const matchesFrench = frenchKeywords.some(k => {
+                const normalizedK = k.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+                return normalizedText === normalizedK || normalizedText.includes(normalizedK);
+            });
+
+            if (matchesFrench && text.split(' ').length <= 2) {
+                if (state.lang !== 'fr') {
                     stateService.setLanguage(from, 'fr');
                     state.lang = 'fr';
+                    logger.debug(`🌐 LANGUAGE SWITCHED TO FRENCH via Keyword: ${textLower}`);
+                }
+            } else if (['hi', 'hello', 'status', 'dashboard', 'menu', 'start', 'invoice', 'expense', 'report'].includes(textLower) && text.split(' ').length <= 2) {
+                if (state.lang !== 'en') {
+                    stateService.setLanguage(from, 'en');
+                    state.lang = 'en';
+                    logger.debug(`🌐 LANGUAGE SWITCHED TO ENGLISH via Keyword: ${textLower}`);
                 }
             }
         }
@@ -414,11 +434,11 @@ class WhatsAppController {
         } else if (state.state === 'IDLE' || text.split(' ').length > 2) {
             // --- AI INTENT FALLBACK ---
             const aiResult = await aiService.classifyIntent(text, from, true);
-            const aiIntent = aiResult.intent;
+            const aiIntent = aiResult?.intent;
 
             if (aiIntent !== 'UNKNOWN' && aiIntent !== 'MENU') {
                 // Check and update language if AI detected a switch
-                if (aiResult.lang && aiResult.lang !== state.lang) {
+                if (aiResult && aiResult.lang && aiResult.lang !== state.lang) {
                     stateService.setLanguage(from, aiResult.lang);
                     state.lang = aiResult.lang;
                 }
@@ -590,17 +610,20 @@ class WhatsAppController {
                     // 1. Deliver the document with a rich Professional Caption
                     try {
                         const date = result.data.date ? new Date(result.data.date).toLocaleDateString(state.lang === 'fr' ? 'fr-FR' : 'en-GB') : 'N/A';
-                        const amount = parseFloat(result.data.total_ttc || result.data.amount || 0);
+                        
+                        // Calculate total from articles (consistent with list logic)
+                        const amount = (result.data.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0) || parseFloat(result.data.total_ttc || result.data.amount || 0);
                         const currency = result.data.currency || 'MAD';
+                        
                         const fmtAmount = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + currency;
-                        const entityName = result.data.client_name || result.data.entity || 'N/A';
+                        const entityName = result.data.client_name || state.data.invoiceData.client_name || result.data.entity || 'N/A';
 
                         const successText = `🧾 *${t('invoice_recorded_header', state.lang)}*\n` +
                                             `━━━━━━━━━━━━━━━━━━\n` +
                                             `🏢 *${t('field_entity_client', state.lang)}:* ${entityName}\n` +
                                             `💰 *${t('field_amount', state.lang)}:* ${fmtAmount}\n` +
                                             `📅 *${t('field_date', state.lang)}:* ${date}\n` +
-                                            `📝 *${t('field_notes', state.lang)}:* ${result.data.description || 'N/A'}\n` +
+                                            `📝 *${t('field_notes', state.lang)}:* ${result.data.notes || result.data.description || 'N/A'}\n` +
                                             `━━━━━━━━━━━━━━━━━━\n` +
                                             `✅ *Status:* ${t('recorded_successfully', state.lang)}`;
 
@@ -991,7 +1014,7 @@ class WhatsAppController {
                         // PDF / Document Handler
                         let documentType = extension === 'pdf' ? 'STATEMENT' : 'EXPENSE';
                         if (state.state.includes('INVOICE')) documentType = 'INVOICE';
-                        data = { documentType, description: `Document: ${message.document?.filename || 'PDF'}` };
+                        data = { documentType }; // Don't overwrite description with technical name
                     }
                 } catch (error) {
                     if (error.message.includes("quota")) {
@@ -1004,7 +1027,7 @@ class WhatsAppController {
                 if (state.state.includes('EXPENSE')) data.documentType = 'EXPENSE';
                 else if (state.state.includes('INVOICE')) data.documentType = 'INVOICE';
                 else if (state.state.includes('STATEMENT')) data.documentType = 'STATEMENT';
-                data.description = `Linked ${type.toUpperCase()} Attachment`;
+                // Don't overwrite description here either
             }
 
             await this.handleDocumentRouting(from, data, localPath, type);
@@ -1752,8 +1775,7 @@ class WhatsAppController {
     const body = t('client_selection_prompt', state.lang);
     const rows = clients.slice(0, 9).map(client => ({
         id: `${client.id}`,
-        title: (client.company_name || client.client_name).substring(0, 24),
-        description: `${t('field_customer_id', state.lang)}: ${client.id}`
+        title: (client.company_name || client.client_name).substring(0, 24)
     }));
 
     rows.push({ id: 'skip_client', title: t('btn_new_client', state.lang), description: t('desc_new_client', state.lang) });
@@ -1781,8 +1803,7 @@ class WhatsAppController {
     const body = t('supplier_selection_prompt', state.lang);
     const rows = suppliers.slice(0, 9).map(s => ({
         id: s.name,
-        title: s.name.substring(0, 24),
-        description: `ID: ${s.id}`
+        title: s.name.substring(0, 24)
     }));
     
     rows.push({ id: 'skip_supplier', title: t('btn_new_supplier', state.lang), description: t('desc_new_supplier', state.lang) });
@@ -1851,6 +1872,8 @@ class WhatsAppController {
       laravelService.getSuppliers(from)
     ]);
 
+    logger.debug(`🔍 Search entities for "${filters.entityName}" among ${clients.length} clients and ${suppliers.length} suppliers`);
+
     // 1. Strict Pass (Substring match)
     const search = filters.entityName.toLowerCase().replace(/[.,!?;:]+$/, "").trim();
     let matchedClients = (clients || []).filter(c => c.client_name.toLowerCase().includes(search));
@@ -1904,9 +1927,30 @@ class WhatsAppController {
     }
 
     // DISAMBIGUATION: Multiple matches found
+    // Count occurrences of each name to detect collisions
+    const counts = {};
+    [...matchedClients, ...matchedSuppliers].forEach(e => {
+        const name = (e.client_name || e.name || 'Unknown').trim();
+        counts[name] = (counts[name] || 0) + 1;
+    });
+
     const combined = [
-      ...matchedClients.map(c => ({ id: `rep_c_${c.id}`, title: `${t('label_client', state.lang)}: ${c.client_name.substring(0,12)}` })),
-      ...matchedSuppliers.map(s => ({ id: `rep_s_${s.id}`, title: `${t('label_supplier', state.lang)}: ${s.name.substring(0,13)}` }))
+      ...matchedClients.map(c => {
+          const name = c.client_name.trim();
+          const prefix = "Clnt: ";
+          const idSuffix = counts[name] > 1 ? ` | ID: ${c.id}` : "";
+          const availableSpace = 20 - prefix.length - idSuffix.length;
+          const displayName = name.substring(0, availableSpace).trim();
+          return { id: `rep_c_${c.id}`, title: `${prefix}${displayName}${idSuffix}` };
+      }),
+      ...matchedSuppliers.map(s => {
+          const name = s.name.trim();
+          const prefix = "Supp: ";
+          const idSuffix = counts[name] > 1 ? ` | ID: ${s.id}` : "";
+          const availableSpace = 20 - prefix.length - idSuffix.length;
+          const displayName = name.substring(0, availableSpace).trim();
+          return { id: `rep_s_${s.id}`, title: `${prefix}${displayName}${idSuffix}` };
+      })
     ].slice(0, 3); // Max 3 buttons
 
     await whatsappService.sendInteractiveButtons(from, 
@@ -2051,34 +2095,34 @@ class WhatsAppController {
       let totalSum = 0;
       let currency = 'MAD';
 
-      transactions.forEach(t => {
+      transactions.forEach((transaction) => {
           let amount = 0;
           if (type === 'inv') {
-              amount = (t.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0);
+              amount = (transaction.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0);
           } else {
-              amount = parseFloat(t.total_ttc || t.ttc || 0);
+              amount = parseFloat(transaction.total_ttc || transaction.ttc || 0);
           }
           totalSum += amount;
-          if (t.currency) currency = t.currency;
+          if (transaction.currency) currency = transaction.currency;
       });
 
-      const rows = transactions.slice(0, 10).map((t) => {
-        const date = t.date ? new Date(t.date).toLocaleDateString(state.lang === 'fr' ? 'fr-FR' : 'en-GB') : 'N/A';
+      const rows = transactions.slice(0, 10).map((transaction) => {
+        const date = transaction.date ? new Date(transaction.date).toLocaleDateString(state.lang === 'fr' ? 'fr-FR' : 'en-GB') : 'N/A';
         
         let amount = 0;
         if (type === 'inv') {
-          amount = (t.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0);
+          amount = (transaction.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0);
         } else {
-          amount = parseFloat(t.total_ttc || t.ttc || 0);
+          amount = parseFloat(transaction.total_ttc || transaction.ttc || 0);
         }
 
-        const fmtAmount = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + (t.currency || currency);
+        const fmtAmount = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + (transaction.currency || currency);
         const prefix = type === 'inv' ? 'v_inv_' : 'v_exp_';
 
         return {
-           id: `${prefix}${t.id}`,
+           id: `${prefix}${transaction.id}`,
            title: `${date} — ${fmtAmount}`,
-           description: t.notes || (type === 'inv' ? `${t('field_invoice_num', state.lang)} #${t.id}` : `${t('field_expense_num', state.lang)} #${t.id}`)
+           description: transaction.notes || (type === 'inv' ? `Invoice Ref: ${transaction.id}` : `Expense Ref: ${transaction.id}`)
         };
       });
 
@@ -2169,4 +2213,8 @@ class WhatsAppController {
   }
 }
 
-module.exports = new WhatsAppController();
+const whatsappController = new WhatsAppController();
+logger.debug(`🚀 WhatsApp Bot Controller Initialized (Mode: ${laravelService.backendMode.toUpperCase()})`);
+logger.debug(`📡 API Base: ${laravelService.baseUrl}`);
+
+module.exports = whatsappController;

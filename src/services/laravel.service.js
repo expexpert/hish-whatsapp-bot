@@ -4,9 +4,18 @@ const logger = require('../utils/logger');
 
 class LaravelService {
   constructor() {
-    this.baseUrl = (process.env.LARAVEL_API_URL || 'http://localhost:8000/api') + '/bot';
-    this.publicUrl = process.env.LARAVEL_PUBLIC_URL || 'http://localhost:8000';
-    this.botSecret = process.env.WHATSAPP_BOT_SECRET ;
+    const backend = process.env.ACTIVE_PHP_BACKEND || 'local';
+    
+    if (backend === 'live') {
+      this.baseUrl = (process.env.LARAVEL_LIVE_API_URL || 'https://simply-compta.com/api') + '/bot';
+      this.publicUrl = process.env.LARAVEL_LIVE_PUBLIC_URL || 'https://simply-compta.com';
+    } else {
+      this.baseUrl = (process.env.LARAVEL_LOCAL_API_URL || 'http://localhost:8000/api') + '/bot';
+      this.publicUrl = process.env.LARAVEL_LOCAL_PUBLIC_URL || 'http://localhost:8000';
+    }
+
+    this.botSecret = process.env.WHATSAPP_BOT_SECRET;
+    this.backendMode = backend;
   }
 
   getBotHeaders(phone = null, skipCooldown = false) {
@@ -32,6 +41,10 @@ class LaravelService {
     // Global AI Limits Bypass (Controlled via Header)
     if (process.env.SKIP_AI_LIMITS === 'true') {
       headers['X-AI-Skip-Limits'] = 'true';
+    }
+
+    if (process.env.DEBUG === 'true') {
+      logger.debug(`📡 [API HEADERS] Host: ${headers['X-Forwarded-Host']}, Phone: ${phone}`);
     }
 
     return headers;
@@ -276,7 +289,7 @@ class LaravelService {
       // Map Bot fields to standard API fields (and include names for Trait mapping)
       form.append('ttc', data.amount);
       form.append('tva', data.vat || 0);
-      form.append('notes', data.description || '');
+      form.append('notes', data.notes || data.description || '');
       form.append('category_name', data.category || 'General');
       form.append('supplier_name', data.entity || 'General');
       form.append('payment_method', data.payment_method || 'WhatsApp');
@@ -396,15 +409,18 @@ class LaravelService {
    * Get Customer Clients for Interactive List
    */
   async getClients(phone) {
-      logger.debug(`👥 Fetching Clients for ${phone}...`);
+      const url = `${this.baseUrl}/customer/customer-clients?sort=recent`;
+      logger.debug(`👥 Fetching Clients: ${url}`);
       try {
-      const response = await axios.get(`${this.baseUrl}/customer/customer-clients?sort=recent`, {
+      const response = await axios.get(url, {
         timeout: 15000,
         headers: this.getBotHeaders(phone)
       });
+      const count = response.data.data ? response.data.data.length : 0;
+      logger.debug(`✅ Found ${count} clients for ${phone}`);
       return response.data.data || [];
     } catch (error) {
-          console.error('Laravel Hybrid Get Clients Error:', error.response?.data || error.message);
+          console.error(`❌ Laravel Get Clients FAIL: ${url}`, error.response?.data || error.message);
       return [];
     }
   }
@@ -429,14 +445,17 @@ class LaravelService {
    * Get Supplier List for Interactive Selection
    */
   async getSuppliers(phone) {
-      logger.debug(`🚚 Fetching Suppliers for ${phone}...`);
+      const url = `${this.baseUrl}/customer/transaction-resources?sort=recent`;
+      logger.debug(`🚚 Fetching Suppliers: ${url}`);
       try {
-      const response = await axios.get(`${this.baseUrl}/customer/transaction-resources?sort=recent`, {
+      const response = await axios.get(url, {
         headers: this.getBotHeaders(phone)
       });
-      return response.data.data.suppliers || [];
+      const suppliers = response.data.data.suppliers || [];
+      logger.debug(`✅ Found ${suppliers.length} suppliers for ${phone}`);
+      return suppliers;
     } catch (error) {
-          console.error('Laravel Hybrid Get Suppliers Error:', error.response?.data || error.message);
+          console.error(`❌ Laravel Get Suppliers FAIL: ${url}`, error.response?.data || error.message);
           return [];
       }
   }
