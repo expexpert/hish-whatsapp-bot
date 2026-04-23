@@ -137,9 +137,21 @@ class WhatsAppController {
         if (cachedAuth !== null) {
           isAuth = cachedAuth;
         } else {
-          isAuth = await laravelService.checkAuth(from);
-          if (isAuth) {
+          const profile = await laravelService.checkAuth(from);
+          if (profile) {
+            isAuth = true;
             stateService.setAuthStatus(from, true);
+            
+            // Sync Database Language to Local State
+            if (profile.bot_lang || profile.lang) {
+                const preference = profile.bot_lang || profile.lang;
+                stateService.setLanguage(from, preference, false); // false = Don't push back to DB
+                
+                // Mark as chosen for this session immediately to skip onboarding
+                const sessionState = await stateService.getUserState(from);
+                sessionState.data.languageChosen = true;
+                await stateService.setUserState(from, sessionState.state, sessionState.data);
+            }
           } else {
             // Failure! Back-off for 30s
             stateService.setBlockedStatus(from);
@@ -154,13 +166,28 @@ class WhatsAppController {
 
           if (now - (state.lastWarned || 0) > cooldown) {
               await whatsappService.sendTextMessage(from, t('auth_required', state.lang));
-              stateService.setLastWarned(from, now);
+              stateService.setUserState(from, state.state, { ...state.data, lastWarned: now });
           }
           return;
       }
 
       const type = message.type;
-      const state = await stateService.getUserState(from);
+      let state = await stateService.getUserState(from);
+
+      // --- LANGUAGE ONBOARDING CHECK ---
+      // If language preference isn't confirmed for this session and isn't currently prompted
+      if (!state.data.languageChosen && state.state !== 'AWAITING_LANGUAGE') {
+          // LAZY SYNC: If we are authed but flag is missing, check DB one last time before prompting
+          const profile = await laravelService.checkAuth(from);
+          if (profile && (profile.bot_lang || profile.lang)) {
+              const preference = profile.bot_lang || profile.lang;
+              stateService.setLanguage(from, preference, false);
+              state.data.languageChosen = true;
+              await stateService.setUserState(from, state.state, state.data);
+          } else {
+              return this.promptLanguageSelection(from);
+          }
+      }
       
       let text = '';
       let interactiveId = null;
@@ -211,6 +238,112 @@ class WhatsAppController {
           interactiveId = message.interactive.button_reply?.id || message.interactive.list_reply?.id;
         }
 
+        // --- 2. VAT SELECTION HANDLER (Forced Flow) ---
+        if (interactiveId && interactiveId.startsWith('set_vat_')) {
+          const vatId = parseInt(interactiveId.replace('set_vat_', ''));
+          const state = await stateService.getUserState(from);
+          
+          if (state.data.invoiceData) {
+            // Fetch names to show in Review
+            const resources = await laravelService.getTaxes(from);
+            const selectedTax = resources?.tax?.find(t => parseInt(t.id) === vatId);
+            
+            state.data.invoiceData.tva_id = vatId;
+            if (selectedTax) {
+                // Localize the name (VAT -> TVA) for FR users
+                const rawName = selectedTax.name || `${selectedTax.rate}%`;
+                state.data.invoiceData.tva_name = this.localizeTaxName(rawName, state.lang);
+                state.data.invoiceData.tva_percentage = selectedTax.rate;
+            }
+          }
+          await stateService.setUserState(from, state.state, state.data);
+          
+          // Resume flow
+          return this.handleDocumentRouting(from, {}, state.data.filePath, 'invoice');
+        }
+
+        // --- LANGUAGE SELECTION HANDLER ---
+        if (interactiveId === 'lang_en' || interactiveId === 'lang_fr') {
+            const lang = interactiveId === 'lang_en' ? 'en' : 'fr';
+            stateService.setLanguage(from, lang);
+            await laravelService.updateLanguage(from, lang); // Sync to DB
+            
+            // Mark as chosen and return to IDLE
+            await stateService.setUserState(from, 'IDLE', { languageChosen: true });
+            
+            // Send welcome menu in the new language
+            return this.sendWelcomeMenu(from);
+        }
+
+        // --- LANGUAGE SWITCH CONFIRMATION ---
+        if (interactiveId === 'switch_yes' || interactiveId === 'switch_no') {
+            const originalData = state.data.originalRequest;
+            if (interactiveId === 'switch_yes') {
+                stateService.setLanguage(from, state.data.newLang);
+                await laravelService.updateLanguage(from, state.data.newLang); // Sync to DB
+            }
+            
+            // Clear the switch state but keep the chosen flag
+            await stateService.setUserState(from, 'IDLE', { languageChosen: true });
+            
+            // Re-process the original message if it exists
+            if (originalData) {
+                originalData._skipLanguagePrompt = true;
+                return this.processMessage(originalData);
+            }
+            return this.sendWelcomeMenu(from);
+        }
+
+        // --- FAST KEYWORD LANGUAGE DETECTION & PROMPTING ---
+        // Instantly detects common words and prompts the user without wasting AI tokens if languages mismatch.
+        const frenchKeywords = ['bonjour', 'salut', 'coucou', 'statut', 'solde', 'tableau', 'compte', 'début', 'annuler', 'état', 'facture', 'dépense', 'rapport', 'résumé', 'accueil'];
+        const englishKeywords = ['hi', 'hello', 'status', 'dashboard', 'start', 'invoice', 'expense', 'report'];
+        const universalKeywords = ['menu'];
+        
+        let manualLanguageSwitched = false;
+        
+        const isIdleOrLangPrompt = state.state === 'IDLE' || state.state === 'AWAITING_LANGUAGE_OVERRIDE';
+        
+        if (isIdleOrLangPrompt && !interactiveId) {
+            const normalizedText = textLower.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+            
+            // 1. Check Universal Words (No language switch possible)
+            if (universalKeywords.includes(textLower)) {
+                manualLanguageSwitched = true; 
+            } else {
+                // 2. Check French Words
+                const matchesFrench = frenchKeywords.some(k => {
+                    const normalizedK = k.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+                    return normalizedText === normalizedK || normalizedText.includes(normalizedK);
+                });
+
+                if (matchesFrench && text.split(' ').length <= 2) {
+                    if (state.lang !== 'fr' && !message._skipLanguagePrompt) {
+                        return this.promptLanguageSwitch(from, 'fr', message);
+                    }
+                    manualLanguageSwitched = true; 
+                } else if (englishKeywords.includes(textLower) && text.split(' ').length <= 2) {
+                    // 3. Check English Words
+                    if (state.lang !== 'en' && !message._skipLanguagePrompt) {
+                        return this.promptLanguageSwitch(from, 'en', message);
+                    }
+                    manualLanguageSwitched = true; 
+                }
+            }
+        }
+
+        // --- SMART LANGUAGE DETECTION ---
+        // For conversational inputs not caught by the fast dictionary
+        if (!manualLanguageSwitched && isIdleOrLangPrompt && !interactiveId && text.length >= 4 && !message._skipLanguagePrompt) {
+            const detected = await aiService.detectLanguage(text, from, false, state.lang);
+            
+            // SECURITY GUARD: Only switch if its different from current lang 
+            // and definitively NOT unknown.
+            if (detected !== 'unknown' && detected !== state.lang) {
+                return this.promptLanguageSwitch(from, detected, message); 
+            }
+        }
+
         const isConfirm = interactiveId === 'confirm' || 
                          ['confirm', 'confirmer', 'ok', 'yes', 'oui', 'save', 'enregistrer'].includes(textLower);
         const isEdit = interactiveId === 'edit' || 
@@ -233,21 +366,21 @@ class WhatsAppController {
         let detectedIntent = null;
         const isShortMessage = text.split(' ').length <= 2;
 
-        // --- PRIORITY PROTECTION FOR FRENCH FLOW ---
+        // --- PRIORITY PROTECTION FOR INTERACTIVE MENUS & FRENCH FLOW ---
         // Prevents "Modifier" (Edit) or "Confirmer" from being misclassified 
         // by AI as a "New Expense/Invoice" intent, which would clear the state.
         const isCoreFrenchAction = state.lang === 'fr' && (isEdit || isConfirm || isCancel);
         
-        if (textLower.startsWith('how much') || textLower.startsWith('combien') || textLower.startsWith('rapport') || 
+        if (interactiveId === 'quick_reports') {
+            // Force priority for exact menu button interactions to avoid NLP regex conflicts
+            detectedIntent = 'reports_menu';
+        } else if (textLower.startsWith('how much') || textLower.startsWith('combien') || textLower.startsWith('rapport') || 
             textLower.includes('summary') || textLower.includes('résumé') || 
             ((textLower.includes('statement') || textLower.includes('relevé')) && (textLower.includes('for') || textLower.includes('pour') || textLower.includes('from') || textLower.includes('de')))) {
             detectedIntent = 'report';
         } else if (isCoreFrenchAction && state.state !== 'IDLE') {
             detectedIntent = null; // Prioritize local state handling over global intent interceptor
             logger.debug(`🛡️ FRENCH CORE ACTION DETECTED (${text}): Bypassing global intent detection.`);
-        } else if (interactiveId === 'quick_reports') {
-            // Force priority for exact menu button interactions to avoid NLP regex conflicts
-            detectedIntent = 'reports_menu';
         } else {
             for (const [intent, config] of Object.entries(primaryIntents)) {
                 // STRICTER CHECK: Only trigger intent switches if:
@@ -287,31 +420,7 @@ class WhatsAppController {
             }
         }
 
-        // --- MANUAL LANGUAGE SWITCHING FOR SHORT COMMANDS ---
-        // If the message is short and explicitly French, switch language immediately (Only when IDLE).
-        // Uses normalization to ignore accents (e.g., 'etat' will match 'état')
-        const frenchKeywords = ['bonjour', 'salut', 'coucou', 'statut', 'solde', 'tableau', 'compte', 'début', 'annuler', 'état', 'facture', 'dépense', 'rapport', 'résumé'];
-        if (state.state === 'IDLE') {
-            const normalizedText = textLower.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-            const matchesFrench = frenchKeywords.some(k => {
-                const normalizedK = k.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-                return normalizedText === normalizedK || normalizedText.includes(normalizedK);
-            });
-
-            if (matchesFrench && text.split(' ').length <= 2) {
-                if (state.lang !== 'fr') {
-                    stateService.setLanguage(from, 'fr');
-                    state.lang = 'fr';
-                    logger.debug(`🌐 LANGUAGE SWITCHED TO FRENCH via Keyword: ${textLower}`);
-                }
-            } else if (['hi', 'hello', 'status', 'dashboard', 'menu', 'start', 'invoice', 'expense', 'report'].includes(textLower) && text.split(' ').length <= 2) {
-                if (state.lang !== 'en') {
-                    stateService.setLanguage(from, 'en');
-                    state.lang = 'en';
-                    logger.debug(`🌐 LANGUAGE SWITCHED TO ENGLISH via Keyword: ${textLower}`);
-                }
-            }
-        }
+        // (Manual language switching was moved up to execute before AI Language Detection for optimization)
 
         // Handle global quick report selections (Exclude during active sub flows)
         if (interactiveId && interactiveId.startsWith('rep_') && 
@@ -405,7 +514,7 @@ class WhatsAppController {
                             return this.handleReportQuery(from, text);
                         }
                         await whatsappService.sendTextMessage(from, t('fetching_status', state.lang));
-                        const stats = await laravelService.getAccountStatus(from);
+                        const stats = await laravelService.getAccountStatus(from, null, null, null, state.lang);
                         await this.sendStatusInteractive(from, stats);
                         return;
                     case 'expense':
@@ -600,32 +709,65 @@ class WhatsAppController {
                 logger.debug('🧾 LARAVEL RESPONSE RECEIVED', result);
                 
                 // Laravel returns the signed URL in 'download_url'
-                if (result.data && (result.data.download_url || result.data.pdf_url || result.data.id)) {
-                    let downloadUrl = result.data.download_url || result.data.pdf_url || `${laravelService.publicUrl}/api/bot/invoice/pdf/${result.data.id}`;
+                if (result.data) {
+                    let downloadUrl = result.data.download_url || result.data.pdf_url || `${config.botPublicUrl}/api/bot/invoice/pdf/${result.data.id}`;
                     
-                    // Defensive: Ensure we are not sending a localhost URL to Meta
+                    // If an original image was uploaded, prioritize returning it as the visual receipt
+                    if (result.data.document_path) {
+                        if (String(result.data.document_path).startsWith('http')) {
+                            downloadUrl = result.data.document_path;
+                        } else {
+                            const pathBase = String(result.data.document_path).replace('public/', '');
+                            downloadUrl = `${config.botPublicUrl}/storage/${pathBase}`;
+                        }
+                    }
+
+                    // Rewrite any local routes returned by the backend to use the public ngrok tunnel
                     if (downloadUrl.includes('localhost') || downloadUrl.includes('127.0.0.1')) {
+                        downloadUrl = downloadUrl.replace(/http(s)?:\/\/(localhost|127\.0\.0\.1):[0-9]+/, config.botPublicUrl);
                     }
                     
-                    // 1. Deliver the document with a rich Professional Caption
+                    const isLocal = false; // We just mapped it to public, so it is safe for Meta
+                    
                     try {
                         const date = result.data.date ? new Date(result.data.date).toLocaleDateString(state.lang === 'fr' ? 'fr-FR' : 'en-GB') : 'N/A';
                         
                         // Calculate total from articles (consistent with list logic)
-                        const amount = (result.data.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0) || parseFloat(result.data.total_ttc || result.data.amount || 0);
-                        const currency = result.data.currency || 'MAD';
+                        const articles = result.data.articles || result.data.items || result.data.invoice_products || [];
+                        const amount = articles.reduce((sum, art) => sum + parseFloat(art.total_price_ht || art.price_ht || 0), 0) || parseFloat(result.data.total_ttc || result.data.amount || 0);
+                        const currency = result.data.currency || state.data.invoiceData.currency || 'MAD';
                         
                         const fmtAmount = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + currency;
                         const entityName = result.data.client_name || state.data.invoiceData.client_name || result.data.entity || 'N/A';
+                        
+                        // Universal VAT Discovery (Prioritize Combined Mathematical Consistency)
+                        const resData = result.data || {};
+                        const tvaRate = parseFloat(resData.tax_rate || resData.tva_percentage || resData.tax_percentage || state.data.invoiceData.tva_percentage || 0);
+
+                        // Calculate Expected VAT based on the final HT amount
+                        const amountHT = articles.reduce((sum, art) => sum + parseFloat(art.total_price_ht || art.price_ht || 0), 0) || parseFloat(result.data.amount || 0);
+                        let tvaAmount = amountHT * (tvaRate / 100);
+                        
+                        // Fallback: If calculation is 0, attempt to pull from backend fields (but math is preferred)
+                        if (tvaAmount === 0) {
+                            tvaAmount = parseFloat(resData.tax_amount || resData.total_tva || resData.total_tax || resData.tax_price || 0);
+                        }
+                        
+                        const fmtVat = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(tvaAmount) + ' ' + currency;
+                        const vatLabel = state.lang === 'fr' ? 'TVA' : 'VAT';
 
                         const successText = `🧾 *${t('invoice_recorded_header', state.lang)}*\n` +
                                             `━━━━━━━━━━━━━━━━━━\n` +
                                             `🏢 *${t('field_entity_client', state.lang)}:* ${entityName}\n` +
                                             `💰 *${t('field_amount', state.lang)}:* ${fmtAmount}\n` +
+                                            `📉 *${vatLabel} (${tvaRate}%):* ${fmtVat}\n` +
                                             `📅 *${t('field_date', state.lang)}:* ${date}\n` +
                                             `📝 *${t('field_notes', state.lang)}:* ${result.data.notes || result.data.description || 'N/A'}\n` +
                                             `━━━━━━━━━━━━━━━━━━\n` +
                                             `✅ *Status:* ${t('recorded_successfully', state.lang)}`;
+
+                        // Force the delivery of the text receipt immediately to bypass any Ngrok/Media Meta drops
+                        await whatsappService.sendTextMessage(from, successText);
 
                         const isPdfRoute = downloadUrl.includes('/pdf');
                         const isImage = result.data.document_path && (
@@ -636,20 +778,20 @@ class WhatsAppController {
                         
                         let waResult;
                         if (!isPdfRoute && isImage) {
-                            // If it's explicitly an image and NOT a generated PDF route
-                            waResult = await whatsappService.sendImage(from, downloadUrl, successText);
+                            // If it's explicitly an image and NOT a generated PDF route, attach it without duplicating text
+                            waResult = await whatsappService.sendImage(from, downloadUrl);
                         } else {
                             // Otherwise send as document with dynamic extension
                             const extension = result.data.document_path ? path.extname(result.data.document_path) : '.pdf';
                             const filename = `Invoice_${result.data.id || 'Draft'}${extension}`;
-                            waResult = await whatsappService.sendDocument(from, downloadUrl, filename, successText);
+                            waResult = await whatsappService.sendDocument(from, downloadUrl, filename);
                         }
                     } catch (waErr) {
-                        // Fallback only if media fails
-                        await whatsappService.sendTextMessage(from, "✅ *Invoice Recorded Successfully*");
+                        // The text message would have already succeeded above
+                        logger.error("Media failed to deliver, but text succeeded: " + waErr.message);
                     }
                 } else {
-                    await whatsappService.sendTextMessage(from, "✅ *Invoice Recorded Successfully*");
+                    await whatsappService.sendTextMessage(from, `✅ *${t('recorded_successfully', state.lang)}*`);
                 }
                 
                 // 2. Clear state and show menu
@@ -704,6 +846,8 @@ class WhatsAppController {
           } else if (interactiveId === 'pay' || textLower === 'payment via') {
             stateService.setUserState(from, (isInvoice ? 'AWAITING_PAYMENT_METHOD_EDIT_INVOICE' : 'AWAITING_PAYMENT_METHOD_EDIT'), state.data );
             await this.sendPaymentMethodSelectionList(from, isInvoice ? 'INVOICE' : 'EXPENSE');
+          } else if (interactiveId === 'vat' || textLower === 'vat') {
+            await this.sendVatSelectionList(from);
           } else if (interactiveId === 'cat' || textLower === 'category') {
             if (isInvoice) {
                 stateService.setUserState(from, 'AWAITING_CATEGORY_EDIT_INVOICE', state.data);
@@ -729,19 +873,15 @@ class WhatsAppController {
             state.state === 'AWAITING_AMOUNT_EDIT_INVOICE' || state.state === 'AWAITING_DESCRIPTION_EDIT_INVOICE' || 
             state.state === 'AWAITING_CATEGORY_EDIT_INVOICE' || state.state === 'AWAITING_PAYMENT_METHOD_EDIT_INVOICE' || 
             state.state === 'AWAITING_DATE_EDIT' || state.state === 'AWAITING_DATE_EDIT_INVOICE' ||
-            state.state === 'AWAITING_INVOICE_DATE') {
+            state.state === 'AWAITING_INVOICE_DATE' || state.state === 'AWAITING_INVOICE_AMOUNT') {
             
-            const isInvoice = state.state.endsWith('_INVOICE') || state.state === 'AWAITING_INVOICE_DATE';
+            const isInvoice = state.state.endsWith('_INVOICE') || state.state.startsWith('AWAITING_INVOICE_');
             const dataObj = isInvoice ? state.data.invoiceData : state.data.expenseData;
 
-            if (state.state.startsWith('AWAITING_AMOUNT_EDIT') || state.state === 'AWAITING_INVOICE_DATE') {
-                if (state.state.startsWith('AWAITING_AMOUNT_EDIT')) {
-                    const amountNum = parseFloat(text.replace(/[^0-9.]/g, ''));
-                    if (!isNaN(amountNum)) dataObj.amount = amountNum;
-                } else {
-                    dataObj.date = text.trim();
-                }
-            } else if (state.state.startsWith('AWAITING_DATE_EDIT')) {
+            if (state.state.startsWith('AWAITING_AMOUNT_EDIT') || state.state === 'AWAITING_INVOICE_AMOUNT') {
+                const amountNum = parseFloat(text.replace(/[^0-9.]/g, ''));
+                if (!isNaN(amountNum)) dataObj.amount = amountNum;
+            } else if (state.state === 'AWAITING_INVOICE_DATE') {
                 dataObj.date = text.trim();
             } else if (state.state.startsWith('AWAITING_DESCRIPTION_EDIT')) {
                 dataObj.description = text;
@@ -859,11 +999,37 @@ class WhatsAppController {
         // --- Handle Invoice Payment Method Selection ---
         if (state.state === 'AWAITING_INVOICE_PAYMENT_METHOD' && !detectedIntent) {
             state.data.invoiceData.payment_method = interactiveId || text;
+            await stateService.setUserState(from, state.state, state.data);
             return this.handleDocumentRouting(from, state.data.invoiceData, state.data.filePath, 'interactive');
         }
 
         if (state.state === 'AWAITING_INVOICE_STATUS' && !detectedIntent) {
             state.data.invoiceData.status = interactiveId ? interactiveId.toUpperCase() : text.toUpperCase();
+            await stateService.setUserState(from, state.state, state.data);
+            return this.handleDocumentRouting(from, state.data.invoiceData, state.data.filePath, 'interactive');
+        }
+
+        // --- Handle Invoice Product Selection ---
+        if (state.state === 'AWAITING_INVOICE_PRODUCT' && !detectedIntent) {
+            const productId = (interactiveId && String(interactiveId).startsWith('inv_p_')) ? String(interactiveId).replace('inv_p_', '') : null;
+            if (productId) {
+                state.data.invoiceData.product_id = parseInt(productId);
+                // If it's a specific product, use its title as the designation if not already set
+                if (!state.data.invoiceData.description || state.data.invoiceData.description === 'No description') {
+                    state.data.invoiceData.description = text;
+                }
+            } else {
+                 // Text entry fallback - try to resolve
+                 const match = await this.resolveProductFromName(from, text);
+                 if (match) {
+                     state.data.invoiceData.product_id = match.id;
+                 } else {
+                     // If still no match, we keep it as a designation but product_id remains missing
+                     // which will re-trigger the selection list in routing.
+                     state.data.invoiceData.description = text;
+                 }
+            }
+            await stateService.setUserState(from, state.state, state.data);
             return this.handleDocumentRouting(from, state.data.invoiceData, state.data.filePath, 'interactive');
         }
 
@@ -913,7 +1079,7 @@ class WhatsAppController {
 
         // --- Handle Expense Amount Input ---
         if (state.state === 'AWAITING_EXPENSE_AMOUNT' && !detectedIntent) {
-            const parsed = await aiService.parseExpenseText(text, [], from, true);
+            const parsed = await aiService.parseExpenseText(text, [], from, true, state.lang);
             const amt = parsed.amount || parseFloat(text.replace(/[^0-9.]/g, ''));
             
             if (!amt || isNaN(amt)) {
@@ -940,9 +1106,10 @@ class WhatsAppController {
         if ((type === 'text' || type === 'audio' || type === 'voice') && isCommand) {
             try {
                 const categories = await laravelService.getCategories(from);
-                // Pass 'true' to skipCooldown because we already checked quota in the intent sensing above
-                const data = await aiService.parseExpenseText(text, categories, from, true);
-                await this.handleDocumentRouting(from, data, null, type);
+                // Pass true to skipCooldown because we already checked quota in the intent sensing above
+                const data = await aiService.parseExpenseText(text, categories, from, true, state.lang);
+                // Ensure audioPath is passed so voice notes are linked as proof
+                await this.handleDocumentRouting(from, data, audioPath || null, type);
             } catch (error) {
                 if (error.message.includes("quota") || error.message.includes("limit")) {
                     await whatsappService.sendTextMessage(from, `🛑 *AI Limit Reached*\n\n${error.message}`);
@@ -1052,214 +1219,164 @@ class WhatsAppController {
    * Centralizes routing for all document types (text or media)
    */
   async handleDocumentRouting(from, data, filePath, type) {
+    if (!data) data = {};
     const state = await stateService.getUserState(from);
     logger.debug(`[DEBUG] ROUTING START - State: ${state?.state}`);
     const existingData = (state && state.data) ? (state.data.expenseData || state.data.invoiceData || {}) : {};
     logger.debug(`[DEBUG] Existing Data:`, existingData);
     const today = new Date().toISOString().split('T')[0];
-    const invalidVals = ['unknown', 'general', 'n/a', 'none', 'null', 'undefined', ''];
+    const invalidVals = ['unknown', 'general', 'n/a', 'none', 'null', 'undefined', '', null];
+
+    // --- 1. ROBUST SMART MERGE (New > Session) ---
+    const isCapturing = state && state.state !== 'IDLE';
+    let mergedData = { ...data };
     
-    // --- MEMOIZATION HELPERS: Ensure we only fetch these lists once per request ---
+    if (isCapturing) {
+        const fields = [
+            'amount', 'currency', 'date', 'status', 'payment_method', 
+            'notes', 'description', 'documentType',
+            'client_id', 'client_name', 'entity', 
+            'supplier_id', 'supplier_name', 'category', 'category_id',
+            'tva_id', 'tva_percentage', 'tva_name', 'vat', 'product_id'
+        ];
+        fields.forEach(f => {
+            const newVal = mergedData[f];
+            const oldVal = existingData[f];
+            // If new is missing/invalid, and old exists, use old.
+            if ((newVal === undefined || newVal === null || invalidVals.includes(String(newVal).toLowerCase())) && 
+                (oldVal !== undefined && oldVal !== null)) {
+                mergedData[f] = oldVal;
+            }
+        });
+        
+        // --- 1.1 DEPENDENCY INVALIDATION (Avoid Sticky IDs) ---
+        // If the NEW extraction (data) contains a master field, force clear its ID counterpart
+        // so the Proactive Resolver can do its job on the new value.
+        const isNewVat = data.vat !== undefined && data.vat !== null && !invalidVals.includes(String(data.vat).toLowerCase());
+        const isNewClient = (data.client_name || data.entity) && !invalidVals.includes(String(data.client_name || data.entity).toLowerCase());
+        const isNewSupplier = (data.supplier_name || data.entity) && !invalidVals.includes(String(data.supplier_name || data.entity).toLowerCase());
+        const isNewAmount = data.amount !== undefined && data.amount !== null && parseFloat(data.amount) > 0;
+
+        if (isNewVat || isNewAmount) {
+            delete mergedData.tva_id;
+            delete mergedData.tva_percentage;
+            delete mergedData.tva_name;
+        }
+        if (isNewClient) {
+            delete mergedData.client_id;
+        }
+        if (isNewSupplier) {
+            delete mergedData.supplier_id;
+        }
+
+        // Forced Type Preservation
+        if (!mergedData.documentType) {
+            if (state.state.includes('INVOICE')) mergedData.documentType = 'INVOICE';
+            else if (state.state.includes('EXPENSE')) mergedData.documentType = 'EXPENSE';
+            else if (state.state.includes('STATEMENT')) mergedData.documentType = 'STATEMENT';
+        }
+    } else {
+        // Handle initial WhatsApp default
+        if (!mergedData.payment_method) mergedData.payment_method = 'WhatsApp';
+    }
+
+    // --- 2. MEMOIZATION HELPERS ---
     let cachedSuppliers = null;
     let cachedClients = null;
-
+    let cachedProducts = null;
     const fetchSuppliers = async () => {
       if (!cachedSuppliers) cachedSuppliers = await laravelService.getSuppliers(from);
       return cachedSuppliers;
     };
-
     const fetchClients = async () => {
       if (!cachedClients) cachedClients = await laravelService.getClients(from);
       return cachedClients;
     };
-
-    let mergedData = { 
-        payment_method: 'WhatsApp',
-        ...data 
+    const fetchProducts = async () => {
+      if (!cachedProducts) cachedProducts = await laravelService.getProducts(from);
+      return cachedProducts;
     };
 
-    // --- 1. NORMALIZATION (AI -> Internal Fields) ---
-    // Move AI 'entity' to 'client_name' or 'supplier_name' before merging
-    if (mergedData.documentType === 'INVOICE' && mergedData.entity && !invalidVals.includes(mergedData.entity.toLowerCase())) {
-        mergedData.client_name = mergedData.entity;
-    }
+    // --- 3. NORMALIZATION & FUZZY LOOKUP ---
+    const sanitize = (val) => val ? String(val).toLowerCase().replace(/[.!]$/, '').trim() : '';
     
-    // Normalize Status immediately
-    if (mergedData.status) {
-        if (mergedData.status.toLowerCase() === 'paid') mergedData.status = 'Paid';
-        if (mergedData.status.toLowerCase() === 'unpaid') mergedData.status = 'Unpaid';
+    // A. Proactive Tax Resolution (Resolve text rates to DB IDs immediately)
+    if (!mergedData.tva_id && (mergedData.vat !== null && mergedData.vat !== undefined)) {
+        const taxMatch = await this.resolveTaxFromRate(from, mergedData.vat, mergedData.amount);
+        if (taxMatch) {
+            mergedData.tva_id = taxMatch.id;
+            mergedData.tva_percentage = taxMatch.rate;
+            mergedData.tva_name = this.localizeTaxName(taxMatch.name, state.lang);
+            logger.debug(`🎯 SMART TAX AUTO-SELECTED (Math Aware): ${taxMatch.rate}% (ID: ${taxMatch.id})`);
+        }
     }
 
-    // --- 2. SMART MERGE (Priority: New > Old) ---
-    const isCapturing = state && state.state !== 'IDLE';
-    if (isCapturing) {
-
-        const invalidVals = ['unknown', 'general', 'n/a', 'none', 'null', 'undefined', ''];
+    if (mergedData.documentType === 'INVOICE' || type === 'invoice') {
+        if (mergedData.entity && !mergedData.client_name) mergedData.client_name = mergedData.entity;
         
-        // Amount priority: New > Old
-        if (!mergedData.amount && existingData.amount) mergedData.amount = existingData.amount;
-        
-        // Category priority: New (if valid) > Old
-        if ((!mergedData.category || invalidVals.includes(mergedData.category.toLowerCase())) && existingData.category) {
-            mergedData.category = existingData.category;
-        }
-        
-        // Entity priority: New (if valid) > Old
-        if ((!mergedData.entity || invalidVals.includes(mergedData.entity.toLowerCase())) && existingData.entity) {
-            mergedData.entity = existingData.entity;
-        }
-        
-        // Status priority: New (if valid) > Old
-        const currentStatus = mergedData.status?.toLowerCase();
-        if ((!mergedData.status || invalidVals.includes(currentStatus)) && existingData.status) {
-            mergedData.status = existingData.status;
+        // A. Client Resolution
+        if (mergedData.client_name && !mergedData.client_id) {
+            const clients = await fetchClients();
+            const searchName = sanitize(mergedData.client_name);
+            const match = (clients || []).find(c => sanitize(c.company_name) === searchName || sanitize(c.client_name) === searchName);
+            if (match) {
+                mergedData.client_id = match.id;
+                mergedData.client_name = match.company_name || match.client_name;
+            }
         }
 
-        // --- SMART DATE PRESERVATION ---
-        // If we have an existing date (like 'Yesterday') and the new one is null or Today (default AI guess), keep the old one.
-        if (existingData.date && (!mergedData.date || mergedData.date === today)) {
-            mergedData.date = existingData.date;
+        // B. NEW: Product Resolution (Treating Product as Category for Invoices)
+        // If the AI returned a 'category' or 'description', try to map it to a DB product.
+        if (!mergedData.product_id) {
+            const productMatch = await this.resolveProductFromName(from, mergedData.category || mergedData.description);
+            if (productMatch) {
+                mergedData.product_id = productMatch.id;
+                // If the product has a specific name, we can use it as designation or keep the user's
+                logger.debug(`🎯 SMART PRODUCT AUTO-SELECTED: ${productMatch.name} (ID: ${productMatch.id})`);
+            }
         }
-
-        if ((!mergedData.notes || mergedData.notes === '') && existingData.notes) mergedData.notes = existingData.notes;
-        if ((!mergedData.description || mergedData.description === '') && existingData.description) mergedData.description = existingData.description;
-
-        // Client Name priority: New (if valid) > Old
-        const newClientName = mergedData.client_name || mergedData.entity;
-        const isClientValid = newClientName && !invalidVals.includes(newClientName.toLowerCase());
+    } else if (mergedData.documentType === 'EXPENSE') {
+        if (mergedData.entity && !mergedData.supplier_id) {
+            const suppliers = await fetchSuppliers();
+            const searchName = sanitize(mergedData.entity);
+            const match = (suppliers || []).find(s => sanitize(s.name) === searchName);
+            if (match) {
+                mergedData.supplier_id = match.id;
+                mergedData.entity = match.name;
+            }
+        }
         
-        if (isClientValid) {
-            // ONLY clear the context ID if the NEW name is actually a match for a DIFFERENT known client
-            // This prevents "Utilities" or other noise from clearing your selected context
-            if (existingData.client_id && existingData.client_name && existingData.client_name.toLowerCase() !== newClientName.toLowerCase()) {
-                const clients = await fetchClients();
-                const searchName = newClientName.toLowerCase().replace(/[.!]$/, '').trim();
-                const isAnotherKnownClient = clients.some(c => 
-                    (c.company_name && c.company_name.toLowerCase().replace(/[.!]$/, '').trim() === searchName) ||
-                    (c.client_name && c.client_name.toLowerCase().replace(/[.!]$/, '').trim() === searchName)
-                );
-                
-                if (isAnotherKnownClient) {
-                    mergedData.client_id = null;
-                    mergedData.client_name = newClientName;
-                } else {
-                    // It's probably noise, stick to the context
-                    mergedData.client_id = existingData.client_id;
-                    mergedData.client_name = existingData.client_name;
-                    mergedData.entity = existingData.client_name; // Sync entity field too
-                }
+        // B. NEW: Category Resolution (Ensures only DB categories are used)
+        if (mergedData.category && !mergedData.category_id) {
+            const catMatch = await this.resolveCategoryFromName(from, mergedData.category);
+            if (catMatch) {
+                mergedData.category_id = catMatch.id;
+                mergedData.category = catMatch.name;
+                logger.debug(`🎯 SMART CATEGORY AUTO-SELECTED: ${catMatch.name} (ID: ${catMatch.id})`);
             } else {
-                mergedData.client_name = newClientName;
+                // Not found - clear so it triggers interactive selection
+                logger.debug(`⚠️ CATEGORY NOT FOUND IN DB: ${mergedData.category}. Clearing for selection.`);
+                delete mergedData.category;
             }
-        } else if (existingData.client_name) {
-            mergedData.client_name = existingData.client_name;
-        }
-
-        if ((!mergedData.description || mergedData.description.includes('Attachment') || mergedData.description.includes('Document') || mergedData.description.includes('Pending')) && (existingData.description || existingData.notes)) {
-            mergedData.description = existingData.description || existingData.notes;
-        }
-        
-        // Preserve Category if already set
-        if (existingData.category && !mergedData.category) {
-            mergedData.category = existingData.category;
-        } else if (existingData.category && mergedData.category && mergedData.category !== existingData.category) {
-            // Keep the one already in session if it's not a generic guess
-            mergedData.category = existingData.category;
-        }
-
-        // --- SMART CURRENCY PRESERVATION ---
-        // If the user manually provided a currency in the initial message/flow, we STICK to it.
-        // AI Vision guesses from images often flip to USD/EUR incorrectly. Use the session data as the source of truth.
-        if (existingData.currency && mergedData.currency !== existingData.currency) {
-            mergedData.currency = existingData.currency;
-        }
-
-        // --- SMART PAYMENT PRESERVATION ---
-        const invalidPay = ['whatsapp', 'other', 'unknown', 'none', null];
-        if (existingData.payment_method && !invalidPay.includes(existingData.payment_method.toLowerCase()) && invalidPay.includes(mergedData.payment_method?.toLowerCase())) {
-            mergedData.payment_method = existingData.payment_method;
-        } else if (existingData.payment_method && !mergedData.payment_method) {
-            mergedData.payment_method = existingData.payment_method;
-        }
-        
-        // STRICTLY preserve original type and data during an active session
-        if (state.state.includes('EXPENSE')) {
-            mergedData.documentType = 'EXPENSE';
-
-            const newEntityName = mergedData.entity;
-            const isEntityValid = newEntityName && !invalidVals.includes(newEntityName.toLowerCase());
-
-            if (isEntityValid && existingData.supplier_id && existingData.entity && existingData.entity.toLowerCase() !== newEntityName.toLowerCase()) {
-                // Check if the NEW name is actually another known supplier
-                const suppliers = await fetchSuppliers();
-                const searchName = newEntityName.toLowerCase().replace(/[.!]$/, '').trim();
-                const isAnotherKnownSupplier = suppliers.some(s => s.name && s.name.toLowerCase().replace(/[.!]$/, '').trim() === searchName);
-                
-                if (isAnotherKnownSupplier) {
-                    mergedData.supplier_id = null;
-                } else {
-                    mergedData.supplier_id = existingData.supplier_id;
-                    mergedData.entity = existingData.entity;
-                }
-            } else if (existingData.supplier_id && (!mergedData.entity || invalidVals.includes(mergedData.entity.toLowerCase()))) {
-                mergedData.supplier_id = existingData.supplier_id;
-                mergedData.entity = existingData.entity;
-            }
-        } else if (state.state.includes('INVOICE')) {
-            mergedData.documentType = 'INVOICE';
-            if (existingData.client_id && (!mergedData.client_name || invalidVals.includes(mergedData.client_name.toLowerCase()))) {
-                mergedData.client_id = existingData.client_id;
-            }
-        } else if (state.state.includes('STATEMENT')) {
-            mergedData.documentType = 'STATEMENT';
-            if (state.data.monthYear) mergedData.monthYear = state.data.monthYear;
         }
     }
 
-    // --- 3. RE-REFINED SEQUENCING: Map and Resolve AFTER Merge ---
-    
-    // Final check for entity mapping
-    if (mergedData.documentType === 'INVOICE' && mergedData.entity && mergedData.entity !== 'General' && (!mergedData.client_name || mergedData.client_name === 'General')) {
-        mergedData.client_name = mergedData.entity;
-    }
-
-    // --- Status Normalization & Protection ---
+    // Status Resolution
     if (mergedData.status) {
-        const s = mergedData.status.toLowerCase();
-        if (s.includes('paid') && !s.includes('unpaid') && !s.includes('partially')) mergedData.status = 'Paid';
+        const s = String(mergedData.status).toLowerCase();
+        if (s.includes('paid') && !s.includes('unpaid')) mergedData.status = 'Paid';
         else if (s.includes('unpaid')) mergedData.status = 'Unpaid';
-        else if (s.includes('partially')) mergedData.status = 'Partially Paid';
     }
 
-    // --- Automated Name Resolution (Punctuation Agnostic) ---
-    const sanitize = (val) => val ? val.toLowerCase().replace(/[.!]$/, '').trim() : '';
-    
-    if (mergedData.client_name && !mergedData.client_id && mergedData.documentType === 'INVOICE') {
-        const clients = await fetchClients();
-        const searchName = sanitize(mergedData.client_name);
-        
-        const match = clients.find(c => 
-            sanitize(c.company_name) === searchName ||
-            sanitize(c.client_name) === searchName
-        );
-        if (match) {
-            mergedData.client_id = match.id;
-            mergedData.client_name = match.company_name || match.client_name;
-        }
-    } else if (mergedData.entity && mergedData.entity !== 'General' && !mergedData.supplier_id && mergedData.documentType === 'EXPENSE') {
-        const suppliers = await fetchSuppliers();
-        const searchName = sanitize(mergedData.entity);
-        
-        const match = suppliers.find(s => sanitize(s.name) === searchName);
-        if (match) {
-            mergedData.supplier_id = match.id;
-            mergedData.entity = match.name;
-        }
-    }
+    // --- 🛣️ ROUTING HIERARCHY ---
 
-    if (mergedData.documentType === 'STATEMENT') {
-        const monthYear = mergedData.monthYear || (isCapturing && state.data?.monthYear);
-
+    if (type === 'status') {
+        const d = new Date();
+        const month = d.getMonth() + 1;
+        const year = d.getFullYear();
+        await this.sendFilteredReport(from, null, false, { month, year });
+    } else if (mergedData.documentType === 'STATEMENT') {
+        const monthYear = mergedData.monthYear || (isCapturing && (state.data?.monthYear));
         if (monthYear && filePath && type !== 'audio') {
             stateService.setUserState(from, 'AWAITING_STATEMENT_CONFIRMATION', { filePath, monthYear });
             await this.sendStatementReviewButtons(from, monthYear);
@@ -1270,110 +1387,68 @@ class WhatsAppController {
             stateService.setUserState(from, 'AWAITING_STATEMENT_MONTH', { filePath });
             await whatsappService.sendTextMessage(from, t('stmt_detected_pdf', state.lang));
         }
-    } else if (mergedData.documentType === 'INVOICE') {
+    } else if (mergedData.documentType === 'INVOICE' || type === 'invoice') {
         const inv = mergedData;
-        const invalidValues = ['unknown', 'general', 'n/a', 'none', 'null', 'undefined'];
-        
-        // --- VALIDATION GUARD: Ensure we have at least an amount or a visual file ---
-        // If it's a voice note (audio), we REQUIRE an amount to be extracted before proceeding.
+
         const isAudio = filePath && filePath.endsWith('.ogg');
-        if (!inv.amount && (!filePath || isAudio)) {
-            const source = isAudio ? t('voice_note', state.lang).toLowerCase() : t('btn_menu', state.lang).toLowerCase(); // Fallback label
-            await whatsappService.sendTextMessage(from, t('error_no_amount_found', state.lang, { source }));
-            return;
-        }
-
-        // --- DATA HARDENING: Pull from session if AI missed it in this specific turn ---
-        if (!inv.status && existingData.status) inv.status = existingData.status;
-        if (!inv.client_id && existingData.client_id) inv.client_id = existingData.client_id;
-        if ((!inv.client_name || invalidValues.includes(inv.client_name.toLowerCase())) && existingData.client_name) inv.client_name = existingData.client_name;
-        if ((!inv.payment_method || inv.payment_method === 'WhatsApp') && existingData.payment_method && existingData.payment_method !== 'WhatsApp') inv.payment_method = existingData.payment_method;
-
-        // 1. Date Check
-        if (!inv.date) {
+        if (!inv.amount || parseFloat(inv.amount) <= 0) {
+            if (!filePath || isAudio) {
+                const source = isAudio ? t('voice_note', state.lang).toLowerCase() : t('btn_menu', state.lang).toLowerCase();
+                await whatsappService.sendTextMessage(from, t('error_no_amount_found', state.lang, { source }));
+            } else {
+                stateService.setUserState(from, 'AWAITING_INVOICE_AMOUNT', { filePath, invoiceData: inv });
+                await whatsappService.sendTextMessage(from, t('error_invalid_amount', state.lang));
+            }
+        } else if (!inv.date) {
             stateService.setUserState(from, 'AWAITING_INVOICE_DATE', { filePath, invoiceData: inv });
             await whatsappService.sendTextMessage(from, t('prompt_invoice_date', state.lang));
-            return;
-        } 
-        
-        // 2. Client Check
-        const isNameInvalid = !inv.client_name || invalidValues.includes(inv.client_name.toLowerCase());
-        if (!inv.client_id && isNameInvalid) {
+        } else if (!inv.client_id && (!inv.client_name || invalidVals.includes(String(inv.client_name).toLowerCase()))) {
             const clients = await fetchClients();
-            if (clients && clients.length > 0) {
-                stateService.setUserState(from, 'AWAITING_INVOICE_CLIENT', { filePath, invoiceData: inv });
-                await this.sendClientSelectionList(from, clients);
-            } else {
-                stateService.setUserState(from, 'AWAITING_NEW_CLIENT_NAME', { filePath, invoiceData: inv });
-                await whatsappService.sendTextMessage(from, t('prompt_ai_no_client', state.lang));
-            }
-            return;
-        }
-
-        // 3. Payment Method Check
-        if (!inv.payment_method || invalidValues.includes(inv.payment_method.toLowerCase()) || inv.payment_method.toLowerCase() === 'whatsapp') {
+            stateService.setUserState(from, 'AWAITING_INVOICE_CLIENT', { filePath, invoiceData: inv });
+            await this.sendClientSelectionList(from, clients);
+        } else if (!inv.payment_method || invalidVals.includes(String(inv.payment_method).toLowerCase()) || String(inv.payment_method).toLowerCase() === 'whatsapp') {
             stateService.setUserState(from, 'AWAITING_INVOICE_PAYMENT_METHOD', { filePath, invoiceData: inv });
             await this.sendPaymentMethodSelectionList(from, 'INVOICE');
-            return;
-        }
-
-        // 4. Status Check (Robust)
-        const hasStatus = inv.status && !invalidValues.includes(inv.status.toLowerCase());
-        if (!hasStatus) {
+        } else if (!inv.status || invalidVals.includes(String(inv.status).toLowerCase())) {
             stateService.setUserState(from, 'AWAITING_INVOICE_STATUS', { filePath, invoiceData: inv });
             await this.sendInvoiceStatusButtons(from);
-            return;
+        } else {
+            logger.debug(`[DEBUG ROUTING] product_id: ${inv.product_id}, tva_id: ${inv.tva_id}, typeof product_id: ${typeof inv.product_id}`);
+            if (!inv.product_id) {
+                const products = await fetchProducts();
+                stateService.setUserState(from, 'AWAITING_INVOICE_PRODUCT', { filePath, invoiceData: inv });
+                await this.sendProductSelectionList(from, products);
+            } else if (!inv.tva_id) {
+                stateService.setUserState(from, 'AWAITING_INVOICE_VAT', { invoiceData: inv, filePath });
+                await this.sendVatSelectionList(from);
+            } else {
+                stateService.setUserState(from, 'AWAITING_INVOICE_CONFIRMATION', { filePath, invoiceData: inv });
+                await this.sendInvoiceReviewButtons(from, inv, filePath);
+            }
         }
+    } else if (mergedData.amount || filePath) {
+        const exp = mergedData;
+        if (!exp.date) exp.date = today;
 
-        // 5. All Clear! Show Review
-        stateService.setUserState(from, 'AWAITING_INVOICE_CONFIRMATION', { filePath, invoiceData: inv });
-        await this.sendInvoiceReviewButtons(from, inv, filePath);
+        if (!exp.amount || parseFloat(exp.amount) <= 0) {
+            stateService.setUserState(from, 'AWAITING_EXPENSE_AMOUNT', { expenseData: exp, receiptPath: filePath });
+            await whatsappService.sendTextMessage(from, t('error_invalid_amount', state.lang));
+        } else if (!exp.category || invalidVals.includes(String(exp.category).toLowerCase())) {
+            const categories = await laravelService.getCategories(from);
+            stateService.setUserState(from, 'AWAITING_EXPENSE_CATEGORY', { expenseData: exp, receiptPath: filePath });
+            await this.sendCategorySelectionList(from, categories);
+        } else if (!exp.payment_method || invalidVals.includes(String(exp.payment_method).toLowerCase()) || String(exp.payment_method).toLowerCase() === 'whatsapp') {
+            stateService.setUserState(from, 'AWAITING_EXPENSE_PAYMENT_METHOD', { expenseData: exp, receiptPath: filePath });
+            await this.sendPaymentMethodSelectionList(from, 'EXPENSE');
+        } else {
+            stateService.setUserState(from, 'AWAITING_EXPENSE_CONFIRMATION', { expenseData: exp, receiptPath: filePath });
+            await this.sendExpenseReviewButtons(from, exp, filePath);
+        }
     } else {
-        // Default: EXPENSE
-        if (mergedData.amount || filePath) {
-            const today = new Date().toISOString().split('T')[0];
-            if (!mergedData.date) mergedData.date = today;
-
-            // Strict Flow: Check for missing or placeholder fields before confirmation
-            const invalidValues = ['unknown', 'general', 'n/a', 'none', 'null', 'undefined'];
-
-            if (!mergedData.amount || parseFloat(mergedData.amount) <= 0) {
-                stateService.setUserState(from, 'AWAITING_EXPENSE_AMOUNT', { expenseData: mergedData, receiptPath: filePath });
-                await whatsappService.sendTextMessage(from, t('error_invalid_amount', state.lang));
-                return;
-            }
-
-            if (!mergedData.category || invalidValues.includes(mergedData.category.toLowerCase())) {
-                const categories = await laravelService.getCategories(from);
-                stateService.setUserState(from, 'AWAITING_EXPENSE_CATEGORY', { expenseData: mergedData, receiptPath: filePath });
-                await this.sendCategorySelectionList(from, categories);
-            } else if (!mergedData.supplier_id && (!mergedData.entity || invalidValues.includes(mergedData.entity.toLowerCase()))) {
-                const suppliers = await fetchSuppliers();
-                if (suppliers && suppliers.length > 0) {
-                    stateService.setUserState(from, 'AWAITING_EXPENSE_ENTITY', { expenseData: mergedData, receiptPath: filePath });
-                    await this.sendSupplierSelectionList(from, suppliers);
-                } else {
-                    // No suppliers found, ask to type it or skip
-                    stateService.setUserState(from, 'AWAITING_ENTITY_EDIT', { expenseData: mergedData, receiptPath: filePath });
-                    await whatsappService.sendTextMessage(from, t('prompt_ai_no_supplier', state.lang));
-                }
-            } else if (!mergedData.payment_method || invalidValues.includes(mergedData.payment_method.toLowerCase()) || mergedData.payment_method.toLowerCase() === 'whatsapp') {
-                stateService.setUserState(from, 'AWAITING_EXPENSE_PAYMENT_METHOD', { expenseData: mergedData, receiptPath: filePath });
-                await this.sendPaymentMethodSelectionList(from, 'EXPENSE');
-            } else {
-                // All fields present!
-                stateService.setUserState(from, 'AWAITING_EXPENSE_CONFIRMATION', { expenseData: mergedData, receiptPath: filePath });
-                await this.sendExpenseReviewButtons(from, mergedData, filePath);
-            }
-        } else if (type !== 'status') {
-            // Re-prompt instead of Menu if we are in a dedicated flow
-            const isCapturing = state && state.state !== 'IDLE';
-            if (isCapturing) {
-                const flowName = state.state.includes('INVOICE') ? 'invoice' : 'expense';
-                await whatsappService.sendTextMessage(from, `🤔 I'm sorry, I couldn't find an amount or valid details in that ${type}. \n\nPlease try again or provide a document for this ${flowName}.`);
-            } else {
-                await this.sendWelcomeMenu(from);
-            }
+        if (state && state.state !== 'IDLE') {
+            await whatsappService.sendTextMessage(from, t('error_parsing_failed', state.lang));
+        } else {
+            await this.sendWelcomeMenu(from);
         }
     }
   }
@@ -1433,10 +1508,10 @@ class WhatsAppController {
       const state = await stateService.getUserState(from);
       if (interactiveId === 'rep_gen_month') {
           await whatsappService.sendTextMessage(from, t('fetching_status', state.lang));
-          const stats = await laravelService.getAccountStatus(from);
+          const stats = await laravelService.getAccountStatus(from, null, null, null, state.lang);
           await this.sendStatusInteractive(from, stats);
       } else if (interactiveId === 'rep_gen_unpaid') {
-          const stats = await laravelService.getAccountStatus(from);
+          const stats = await laravelService.getAccountStatus(from, null, null, null, state.lang);
           if (stats.total_unpaid_sum > 0) {
               await whatsappService.sendTextMessage(from, t('alert_unpaid_total', state.lang, { total: stats.total_unpaid_sum, count: stats.invoicesCount }));
           } else if (stats.invoicesCount > 0) {
@@ -1451,18 +1526,26 @@ class WhatsAppController {
           const parts = interactiveId.split('_');
           const isClient = parts[1] === 'c';
           const entityId = parts[2];
+          const currentState = await stateService.getUserState(from);
           
-          // Fetch the full entity details so we don't 'lose track' in the next step
           const entities = isClient ? await laravelService.getClients(from) : await laravelService.getSuppliers(from);
           const entity = entities ? entities.find(e => e.id == entityId) : null;
           
-          if (entity) {
-              stateService.setUserState(from, 'AWAITING_REPORT_PERIOD', { entityId, isClient, entity });
-              await this.sendReportPeriodButtons(from);
-          } else {
-              await whatsappService.sendTextMessage(from, "❌ Sorry, I couldn't find that record. Please try searching for them again.");
+          if (!entity) {
               stateService.clearUserState(from);
+              return whatsappService.sendTextMessage(from, t('error_record_not_found', currentState.lang));
           }
+
+          // INTELLIGENT DISAMBIGUATION: Carry over search filters if they exist
+          if (currentState.state === 'AWAITING_REPORT_DISAMBIGUATION' && currentState.data.filters) {
+              const filters = currentState.data.filters;
+              stateService.clearUserState(from);
+              return this.sendFilteredReport(from, entity, isClient, filters);
+          }
+          
+          // Default: ask for period
+          stateService.setUserState(from, 'AWAITING_REPORT_PERIOD', { entityId, isClient, entity });
+          await this.sendReportPeriodButtons(from);
       }
   }
 
@@ -1532,16 +1615,49 @@ class WhatsAppController {
     );
   }
 
+  async promptLanguageSelection(from) {
+      // First-time onboarding language pick
+      await stateService.setUserState(from, 'AWAITING_LANGUAGE', {});
+      const buttons = [
+          { id: 'lang_en', title: t('btn_lang_en', 'en') },
+          { id: 'lang_fr', title: t('btn_lang_fr', 'en') }
+      ];
+      await whatsappService.sendInteractiveButtons(from, t('welcome_language', 'fr'), buttons);
+  }
+
+  async promptLanguageSwitch(from, newLang, originalMessage) {
+      const state = await stateService.getUserState(from);
+      await stateService.setUserState(from, 'AWAITING_LANGUAGE_OVERRIDE', { 
+          newLang, 
+          originalRequest: originalMessage 
+      });
+
+      const buttons = [
+          { id: 'switch_yes', title: t('btn_switch_yes', state.lang) },
+          { id: 'switch_no', title: t('btn_switch_no', state.lang) }
+      ];
+      await whatsappService.sendInteractiveButtons(from, t('lang_switch_detected', state.lang), buttons);
+  }
+
   async sendStatusInteractive(from, stats) {
     const state = await stateService.getUserState(from);
     const { targetMonth, targetYear } = stats;
 
     // 1. Parallel fetch details (Invoices, Expenses, Statements) - Synchronized with target period
-    const [invoices, expenses, statements] = await Promise.all([
+    let [invoices, expenses, statements] = await Promise.all([
       laravelService.getInvoices(from, 'ISSUED', targetMonth, targetYear),
       laravelService.getExpenses(from, targetMonth, targetYear),
       laravelService.getBankStatements(from, targetMonth, targetYear)
     ]);
+
+    // Bot-Side Enforcement: The Live PHP API sometimes ignores the search filter and returns all statements.
+    // We strictly enforce the search locally so '03-2026' doesn't bleed into '01-2024' reports.
+    if (targetMonth && targetYear) {
+        const expectedFormat = `${String(targetMonth).padStart(2, '0')}-${targetYear}`;
+        statements = statements.filter(s => s.month_year === expectedFormat);
+    } else if (targetYear && !targetMonth) {
+        statements = statements.filter(s => String(s.month_year).endsWith(String(targetYear)));
+    }
 
     const income = stats.salesSum || 0;
     const expensesTotal = stats.expensesSum || 0;
@@ -1617,17 +1733,17 @@ class WhatsAppController {
         ? `${t('report_missing', state.lang)} ${missing.join(', ')}\n_(${t('upload_portal_msg', state.lang)})_` 
         : t('report_ready', state.lang);
 
-    let body = `${t('report_title', state.lang)}: ${stats.month}\n` +
+    let body = `📊 *${t('report_title', state.lang)} : ${stats.month}*\n` +
                `━━━━━━━━━━━━━━━━━━\n\n` +
-               `${t('report_performance', state.lang)}\n` +
-               `* ${t('report_income', state.lang)}:   ${fmt(income)}\n` +
-               `* ${t('report_expenses', state.lang)}: ${fmt(expensesTotal)}\n` +
+               `💰 *${t('report_income', state.lang)} :* ${fmt(income)}\n` +
+               `📉 *${t('report_expenses', state.lang)} :* ${fmt(expensesTotal)}\n` +
+               `✨ *${t('report_balance', state.lang)} : ${fmt(balance)}*\n\n` +
                `━━━━━━━━━━━━━━━━━━\n` +
-               `🏦 *${t('report_balance', state.lang)}:  ${fmt(balance)}*\n\n` +
-               `${t('report_tax', state.lang)}\n` +
-               `* ${t('report_vat', state.lang)}:    ${fmt(vat)}\n\n` +
-               `${t('report_progress', state.lang)}\n` +
-               `* ${t('report_status', state.lang)}: ${statusIcon} ${statusText}\n\n` +
+               `🏛️ *${t('report_tax', state.lang)}*\n` +
+               `👉 *${t('report_vat', state.lang)} : ${fmt(vat)}*\n\n` +
+               `━━━━━━━━━━━━━━━━━━\n` +
+               `📈 *${t('report_progress', state.lang)}*\n` +
+               `* ${t('report_status', state.lang)} : ${statusIcon} ${statusText}\n\n` +
                detailText +
                `${missingText}\n\n` +
                `━━━━━━━━━━━━━━━━━━\n` +
@@ -1689,8 +1805,19 @@ class WhatsAppController {
     const payKey = `pay_${rawPayment.replace(/[\s\/]/g, '_')}`;
     const localizedPayment = t(payKey, state.lang);
 
-    let body = `*${t('review_invoice', state.lang)}*\n` +
-      `*${t('field_amount', state.lang)}:* ${invoiceData.amount} ${invoiceData.currency || 'MAD'}\n` +
+    // --- Official Tax Calculation (HT + TVA = TTC) ---
+    const total_ht = parseFloat(invoiceData.amount || 0);
+    const tva_rate = parseFloat(invoiceData.tva_percentage || 0);
+    const tva_amount = total_ht * (tva_rate / 100);
+    const total_ttc = total_ht + tva_amount;
+
+    const locale = state.lang === 'fr' ? 'fr-FR' : 'en-US';
+    const fmt = (val) => new Intl.NumberFormat(locale, { minimumFractionDigits: 2 }).format(val) + ' ' + (invoiceData.currency || 'MAD');
+
+    let body = `*${t('review_invoice', state.lang)}*\n\n` +
+      `*${t('field_total_ht', state.lang)}:* ${fmt(total_ht)}\n` +
+      `*${t('field_tva_amount', state.lang)} (${tva_rate}%):* ${fmt(tva_amount)}\n` +
+      `*${t('field_total_ttc', state.lang)}:* ${fmt(total_ttc)}\n\n` +
       `*${t('field_date', state.lang)}:* ${invoiceData.date || '---'}\n` +
       `*${t('field_entity_client', state.lang)}:* ${invoiceData.entity || '...'}\n` +
       `*${t('field_payment', state.lang)}:* ${localizedPayment}\n` +
@@ -1741,6 +1868,10 @@ class WhatsAppController {
       { id: 'ent', title: isInvoice ? t('field_entity_client', state.lang) : t('field_entity_supplier', state.lang) },
       { id: 'pay', title: t('field_payment', state.lang) }
     ];
+
+    if (isInvoice) {
+      rows.splice(3, 0, { id: 'vat', title: t('field_vat', state.lang) });
+    }
 
     if (!isInvoice) {
       rows.splice(3, 0, { id: 'cat', title: t('field_category', state.lang) });
@@ -1843,18 +1974,10 @@ class WhatsAppController {
     const state = await stateService.getUserState(from);
     const filters = await aiService.parseReportQuery(text, from);
     
-    // Safety Net: If AI incorrectly matched a month as an entity name
-    const months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
-    if (filters.entityName && months.includes(filters.entityName.toLowerCase())) {
-      const mIdx = months.indexOf(filters.entityName.toLowerCase()) + 1;
-      filters.month = mIdx;
-      filters.entityName = null;
-    }
-
     if (!filters.entityName) {
       // General status report
       await whatsappService.sendTextMessage(from, t('fetching_status', state.lang));
-      const stats = await laravelService.getAccountStatus(from, filters.month, filters.year);
+      const stats = await laravelService.getAccountStatus(from, filters.month, filters.year, null, state.lang);
       const monthsLabel = state.lang === 'fr' 
         ? ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
         : ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
@@ -2004,12 +2127,57 @@ class WhatsAppController {
     if (isClient) queryParams.client_id = entity.id;
     else queryParams.supplier_id = entity.id;
 
-    const stats = await laravelService.getAccountStatus(from, queryParams.month, queryParams.year, queryParams.client_id, queryParams.supplier_id);
-    
-    if (!stats) {
-      return whatsappService.sendTextMessage(from, t('auth_required', state.lang)); // Placeholder error
+    // Item-Derived Aggregation & Tax Mappings (Bypass Live API missing relationship)
+    const [invoices, expenses, taxResources] = await Promise.all([
+        laravelService.getInvoices(from, null, filters.month, filters.year, isClient ? entity.id : null),
+        laravelService.getExpenses(from, filters.month, filters.year, isClient ? null : entity.id),
+        laravelService.getTaxes(from)
+    ]);
+
+    // Build Bot-Side Tax Map
+    const taxMap = {};
+    if (taxResources && taxResources.tax) {
+        taxResources.tax.forEach(t => {
+            taxMap[t.id] = parseFloat(t.rate || 0);
+        });
     }
+
+    const currency = (invoices[0] || expenses[0] || {}).currency || 'MAD';
     
+    // Revenue HT Calculation (from Invoice Articles)
+    const revenueStats = invoices.reduce((acc, inv) => {
+        const articles = inv.articles || inv.items || inv.invoice_products || [];
+        const invHT = articles.reduce((sum, art) => sum + parseFloat(art.total_price_ht || art.price_ht || 0), 0) || parseFloat(inv.amount || 0);
+        
+        // Ultimate Reporting Consistency: Always re-calculate from articles/rate
+        // PRIORITIZE art.tax.rate (Relationship) -> Bot-Side Map -> raw ID fallback
+        const invVAT = articles.reduce((sum, art) => {
+            const ht = parseFloat(art.total_price_ht || art.price_ht || 0);
+            
+            let rate = 0;
+            if (art.tax && art.tax.rate !== undefined) {
+                rate = parseFloat(art.tax.rate);
+            } else if (art.tva_percentage && taxMap[art.tva_percentage] !== undefined) {
+                rate = taxMap[art.tva_percentage];
+            } else {
+                rate = parseFloat(art.tva_percentage || art.tax_rate || art.tax_percentage || 0);
+            }
+            
+            return sum + (ht * (rate / 100));
+        }, 0) || parseFloat(inv.total_vat_payable || inv.total_tva || inv.tax_amount || 0);
+
+        acc.revenueHT += invHT;
+        acc.vatCollected += invVAT;
+        if (inv.status === 'ISSUED') acc.outstanding += invHT; 
+        return acc;
+    }, { revenueHT: 0, vatCollected: 0, outstanding: 0 });
+
+    const expenseStats = expenses.reduce((acc, exp) => {
+        acc.totalTTC += parseFloat(exp.total_ttc || exp.amount || 0);
+        acc.totalVAT += parseFloat(exp.total_tva || exp.tax_amount || 0);
+        return acc;
+    }, { totalTTC: 0, totalVAT: 0 });
+
     const name = isClient ? entity.client_name : entity.name;
     const icon = isClient ? '👤' : '🚚';
     const months = state.lang === 'fr' 
@@ -2022,20 +2190,20 @@ class WhatsAppController {
     }
 
     let report = `${icon} *${t('report_for', state.lang, { name })}*\n`;
-    if (periodStr) report += `📅 *${t('field_period', state.lang)}:* ${periodStr}\n`;
-    report += `--- \n\n`;
+    if (periodStr) report += `📅 *${t('field_period', state.lang)} :* ${periodStr}\n`;
+    report += `━━━━━━━━━━━━━━━━━━\n\n`;
 
     if (isClient) {
       // --- CLIENT VIEW (SALES) ---
-      report += `💰 *${t('field_revenue', state.lang)}:* ${(stats.salesSum || 0).toFixed(2)}\n`;
-      report += `🕒 *${t('field_outstanding', state.lang)}:* ${(stats.total_unpaid_sum || 0).toFixed(2)}\n`;
-      report += `📈 *${t('field_quotes', state.lang)}:* ${(stats.total_quote_sum || 0).toFixed(2)}\n`;
-      report += `🏛️ *${t('field_vat_collected', state.lang)}:* ${(stats.cash_vat_sum || 0).toFixed(2)}\n`;
+      report += `💰 *${t('field_revenue', state.lang)} :* ${revenueStats.revenueHT.toFixed(2)} ${currency}\n`;
+      report += `🕒 *${t('field_outstanding', state.lang)} :* ${revenueStats.outstanding.toFixed(2)} ${currency}\n`;
+      report += `📦 *${t('field_quotes', state.lang)} :* ${((await laravelService.getAccountStatus(from, filters.month, filters.year, entity.id, state.lang)).total_quote_sum || 0).toFixed(2)} ${currency}\n`;
+      report += `🏛️ *${t('field_vat_collected', state.lang)} :* ${revenueStats.vatCollected.toFixed(2)} ${currency}\n`;
     } else {
       // --- SUPPLIER VIEW (PURCHASES) ---
-      report += `💸 *${t('report_expenses', state.lang)}:* ${(stats.expensesSum || 0).toFixed(2)}\n`;
-      report += `🏷️ *${t('field_vat_paid', state.lang)}:* ${(stats.expenseVat || 0).toFixed(2)}\n`;
-      report += `📋 *${t('field_records', state.lang)}:* ${stats.expensesCount || 0}\n`;
+      report += `💸 *${t('report_expenses', state.lang)} :* ${expenseStats.totalTTC.toFixed(2)} ${currency}\n`;
+      report += `🏷️ *${t('field_vat_paid', state.lang)} :* ${expenseStats.totalVAT.toFixed(2)} ${currency}\n`;
+      report += `📋 *${t('field_records', state.lang)} :* ${expenses.length}\n`;
     }
 
     report += `\n${t('portal_full_history', state.lang)}`;
@@ -2122,7 +2290,7 @@ class WhatsAppController {
         return {
            id: `${prefix}${transaction.id}`,
            title: `${date} — ${fmtAmount}`,
-           description: transaction.notes || (type === 'inv' ? `Invoice Ref: ${transaction.id}` : `Expense Ref: ${transaction.id}`)
+           description: transaction.notes || (type === 'inv' ? t('field_invoice_num', state.lang) + ` Ref: ${transaction.id}` : t('field_expense_num', state.lang) + ` Ref: ${transaction.id}`)
         };
       });
 
@@ -2164,29 +2332,68 @@ class WhatsAppController {
         label = "Expense";
       }
 
+      if (document.articles) {
+          logger.debug(`🔍 [DOCUMENT MATCHED] Type: ${type}, ID: ${id}`);
+      }
+
       if (!document || !document.download_url) {
         return whatsappService.sendTextMessage(from, t('error_media_delivery', state.lang, { label, id }));
       }
 
       const date = document.date ? new Date(document.date).toLocaleDateString('en-GB') : 'N/A';
       
-      // Calculate amount
-      let amount = 0;
-      if (type === 'inv') {
-        amount = (document.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0);
-      } else {
-        amount = parseFloat(document.total_ttc || document.ttc || 0);
+      // Fetch tax resources to map ID to rate (Bot-Side API Map)
+      const taxResources = await laravelService.getTaxes(from);
+      const taxMap = {};
+      if (taxResources && taxResources.tax) {
+          taxResources.tax.forEach(t => taxMap[t.id] = parseFloat(t.rate || 0));
       }
+
+      // Calculate amount (HT) and VAT from articles
+      let amountHT = 0;
+      let tvaAmount = 0;
+      let tvaRate = 0;
+
+      if (type === 'inv') {
+        const articles = document.articles || document.items || document.invoice_products || [];
+        amountHT = articles.reduce((sum, art) => sum + parseFloat(art.total_price_ht || art.price_ht || 0), 0) || parseFloat(document.amount || 0);
+        
+        // Priority 1: Backend Pre-calculated Fields (for Consistency)
+        tvaAmount = parseFloat(document.total_vat_payable || document.total_tva || document.total_tax || document.tax_amount || document.tax_price || 0);
+        let rawTvaRate = document.tax_rate || document.tva_percentage || document.tax_percentage || 0;
+        tvaRate = taxMap[rawTvaRate] !== undefined ? taxMap[rawTvaRate] : parseFloat(rawTvaRate);
+
+        // Priority 2: Manual Math Fallback
+        if (tvaAmount === 0 && articles.length > 0) {
+            tvaAmount = articles.reduce((sum, art) => {
+                const ht = parseFloat(art.total_price_ht || art.price_ht || 0);
+                const rawArtRate = parseFloat(art.tva_percentage || art.tax_rate || art.tax_percentage || 0);
+                const processedRate = taxMap[rawArtRate] !== undefined ? taxMap[rawArtRate] : rawArtRate;
+                
+                if (processedRate > 0 && !tvaRate) tvaRate = processedRate; 
+                return sum + (ht * (processedRate / 100));
+            }, 0);
+        }
+      } else {
+        amountHT = parseFloat(document.net_amount || document.amount || document.total_ttc || 0);
+        tvaAmount = parseFloat(document.total_tva || document.tax_amount || 0);
+        tvaRate = document.tax_rate || 0;
+      }
+
+      const locale = state.lang === 'fr' ? 'fr-FR' : 'en-US';
       const currency = document.currency || 'MAD';
-      const fmtAmount = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + currency;
+      const fmtHT = new Intl.NumberFormat(locale, { minimumFractionDigits: 2 }).format(amountHT) + ' ' + currency;
+      const fmtVat = new Intl.NumberFormat(locale, { minimumFractionDigits: 2 }).format(tvaAmount) + ' ' + currency;
       const entityName = type === 'inv' ? (document.client?.client_name || 'N/A') : (document.supplier?.supplier_name || 'N/A');
       const entityLabelText = type === 'inv' ? t('label_client', state.lang) : t('label_supplier', state.lang);
       const notesText = document.notes || document.description || 'N/A';
+      const vatLabel = state.lang === 'fr' ? 'TVA' : 'VAT';
 
       const successText = `🧾 *${t('media_doc_title', state.lang, { label: label.toUpperCase() })}*\n` +
                           `━━━━━━━━━━━━━━━━━━\n` +
                           `🏢 *${entityLabelText}:* ${entityName}\n` +
-                          `💰 *${t('field_amount', state.lang)}:* ${fmtAmount}\n` +
+                          `💰 *Total HT:* ${fmtHT}\n` +
+                          `📉 *${vatLabel} (${tvaRate}%):* ${fmtVat}\n` +
                           `📅 *${t('field_date', state.lang)}:* ${date}\n` +
                           `📝 *${t('field_notes', state.lang)}:* ${notesText}\n` +
                           `━━━━━━━━━━━━━━━━━━\n` +
@@ -2210,6 +2417,180 @@ class WhatsAppController {
       console.error('handleDeliverSpecificMedia error:', error);
       await whatsappService.sendTextMessage(from, t('error_lost_track', state.lang)); // Generic error fallback
     }
+  }
+  /**
+   * Send VAT selection list (Compulsory Flow)
+   */
+  async sendVatSelectionList(from) {
+    const state = await stateService.getUserState(from);
+    const resources = await laravelService.getTaxes(from);
+    
+    const text = t('prompt_vat_selection', state.lang);
+
+    if (!resources || !resources.tax || resources.tax.length === 0) {
+      // Fallback to manual entry if API fails
+      await whatsappService.sendTextMessage(from, t('prompt_vat_selection', state.lang) + t('vat_selection_eg', state.lang));
+      return;
+    }
+
+    const taxes = resources.tax;
+    
+    // Always show as List for VAT selection
+    const rows = taxes.map(t => ({
+      id: `set_vat_${t.id}`,
+      title: this.localizeTaxName(t.name || `${t.rate}%`, state.lang),
+      description: `Rate: ${t.rate}%`
+    }));
+
+    await whatsappService.sendInteractiveList(
+      from, 
+      text, 
+      t('list_button_vat', state.lang), 
+      [{ title: t('section_available_taxes', state.lang), rows }]
+    );
+  }
+
+  /**
+   * Helper to find a database Tax ID based on a raw percentage rate (e.g. 20)
+   * Hardened with Smart Math to detect rates from absolute VAT amounts.
+   */
+  async resolveTaxFromRate(from, vatValue, totalAmount = 0) {
+    try {
+        const resources = await laravelService.getTaxes(from);
+        if (!resources || !resources.tax) return null;
+
+        const rateInput = parseFloat(vatValue);
+        if (isNaN(rateInput)) return null;
+
+        logger.debug(`🔍 [DEBUG] Resolving tax for input: ${rateInput} (Total Amount: ${totalAmount}) among ${resources.tax.length} options`);
+
+        // Phase 1: Direct Match (Treating input as a percentage - e.g., 2)
+        // If the number is small (e.g. 2), we strongly suspect it's a rate.
+        let match = resources.tax.find(t => Math.abs(parseFloat(t.rate) - rateInput) < 0.01);
+        if (match) {
+            return {
+                id: parseInt(match.id),
+                rate: match.rate,
+                name: match.name || `${match.rate}%`
+            };
+        }
+
+        // Phase 2: Back-calculate (Treating input as a total VAT amount - e.g., 200 recorded for 1000)
+        if (totalAmount > 0) {
+            const calculatedRate = (rateInput / totalAmount) * 100;
+            logger.debug(`🔍 [DEBUG] Trying back-calculated rate: ${calculatedRate.toFixed(2)}%`);
+            
+            match = resources.tax.find(t => Math.abs(parseFloat(t.rate) - calculatedRate) < 0.01);
+            if (match) {
+                return {
+                    id: parseInt(match.id),
+                    rate: match.rate,
+                    name: match.name || `${match.rate}%`
+                };
+            }
+
+            // Try alternate math: If totalAmount was TTC (vat included)
+            if (totalAmount > rateInput) {
+                const altRate = (rateInput / (totalAmount - rateInput)) * 100;
+                logger.debug(`🔍 [DEBUG] Trying alternate back-calculated rate (TTC mode): ${altRate.toFixed(2)}%`);
+                match = resources.tax.find(t => Math.abs(parseFloat(t.rate) - altRate) < 0.01);
+                if (match) {
+                    return {
+                        id: parseInt(match.id),
+                        rate: match.rate,
+                        name: match.name || `${match.rate}%`
+                    };
+                }
+            }
+        }
+
+        return null;
+    } catch (err) {
+        logger.error('❌ Error in resolveTaxFromRate:', err);
+        return null;
+    }
+  }
+
+  /**
+   * Resolves a text category name to a database ID
+   */
+  async resolveCategoryFromName(from, categoryName) {
+    try {
+        const categories = await laravelService.getCategories(from);
+        if (!categories || categories.length === 0) return null;
+
+        const sanitize = (val) => val ? String(val).toLowerCase().replace(/[.!]$/, '').trim() : '';
+        const searchName = sanitize(categoryName);
+        
+        // Phase 1: Exact Match
+        let match = categories.find(c => sanitize(c.name) === searchName);
+        if (match) return match;
+
+        // Phase 2: Partial Match (e.g. "Food" matches "Food & Dining")
+        match = categories.find(c => searchName.includes(sanitize(c.name)) || sanitize(c.name).includes(searchName));
+        if (match) return match;
+
+        return null;
+    } catch (err) {
+        logger.error('❌ Error in resolveCategoryFromName:', err);
+        return null;
+    }
+  }
+
+  /**
+   * Resolves a text name to a database Product ID
+   */
+  async resolveProductFromName(from, productName) {
+    if (!productName) return null;
+    try {
+        const products = await laravelService.getProducts(from);
+        if (!products || products.length === 0) return null;
+
+        const sanitize = (val) => val ? String(val).toLowerCase().replace(/[.!]$/, '').trim() : '';
+        const searchName = sanitize(productName);
+        
+        // Phase 1: Exact Match
+        let match = products.find(p => sanitize(p.name) === searchName);
+        if (match) return match;
+
+        // Phase 2: Partial Match
+        match = products.find(p => searchName.includes(sanitize(p.name)) || sanitize(p.name).includes(searchName));
+        if (match) return match;
+
+        return null;
+    } catch (err) {
+        logger.error('❌ Error in resolveProductFromName:', err);
+        return null;
+    }
+  }
+
+  async sendProductSelectionList(from, products) {
+    const state = await stateService.getUserState(from);
+    const body = t('product_select_title', state.lang);
+    const rows = (products || []).slice(0, 10).map(p => ({
+        id: `inv_p_${p.id}`,
+        title: String(p.name).substring(0, 24)
+    }));
+
+    if (rows.length === 0) {
+        // If no products, we can't force selection - maybe use default 1?
+        // But the user said "pure DB thing", so let's keep it empty or show error
+        rows.push({ id: 'inv_p_1', title: 'Default Service' });
+    }
+
+    await whatsappService.sendInteractiveList(from, body, t('btn_select_product', state.lang), [
+        { title: t('products', state.lang), rows }
+    ]);
+  }
+
+  /**
+   * Simple helper to localize Tax names from DB
+   */
+  localizeTaxName(name, lang) {
+    if (lang === 'fr') {
+        return name.replace(/VAT/gi, 'TVA');
+    }
+    return name;
   }
 }
 

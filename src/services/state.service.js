@@ -8,22 +8,42 @@ const authCache = new Map();
 class StateService {
   setUserState(phoneNumber, state, data = {}) {
     const currentState = this.getUserState(phoneNumber);
-    userStates.set(phoneNumber, { state, data, lang: currentState.lang || 'en' });
+    const mergedData = { ...data };
+    
+    // Critically preserve the languageChosen flag across ALL state transitions
+    if (currentState.data && currentState.data.languageChosen) {
+        mergedData.languageChosen = true;
+    }
+    
+    userStates.set(phoneNumber, { state, data: mergedData, lang: currentState.lang || 'fr' });
   }
 
   getUserState(phoneNumber) {
-    return userStates.get(phoneNumber) || { state: 'IDLE', data: {}, lang: 'en' };
+    const state = userStates.get(phoneNumber) || { state: 'IDLE', data: {}, lang: 'fr' };
+    return state;
   }
 
-  setLanguage(phoneNumber, lang) {
+  setLanguage(phoneNumber, lang, pushToDb = true) {
     const state = this.getUserState(phoneNumber);
     state.lang = lang;
     userStates.set(phoneNumber, state);
+    
+    // We don't import laravelService here to avoid circular dependency
+    // Instead, the controller handles the DB push if needed, 
+    // or we can pass a callback. For now, since the controller calls this,
+    // we just update the memory state.
   }
 
   clearUserState(phoneNumber) {
     const currentState = this.getUserState(phoneNumber);
-    userStates.set(phoneNumber, { state: 'IDLE', data: {}, lang: currentState.lang || 'en' });
+    const data = {};
+    
+    // Preserve session flags
+    if (currentState.data && currentState.data.languageChosen) {
+        data.languageChosen = true;
+    }
+    
+    userStates.set(phoneNumber, { state: 'IDLE', data, lang: currentState.lang || 'fr' });
   }
 
   // --- Auth Cache (Solves Rate Limiting) ---

@@ -13,13 +13,13 @@ class AIService {
   /**
    * Main parsing gateway: Real OpenAI vs. Regex Fallback
    */
-  async parseExpenseText(text, categories = [], phone = null, skipCooldown = false) {
+  async parseExpenseText(text, categories = [], phone = null, skipCooldown = false, systemLang = 'en') {
     if (this.openai && phone) {
       const status = await laravelService.checkAiStatus(phone, skipCooldown);
       if (!status.allowed) {
         throw new Error(status.message || "AI quota exceeded.");
       }
-      return this.parseWithOpenAI(text, categories, phone, skipCooldown);
+      return this.parseWithOpenAI(text, categories, phone, skipCooldown, systemLang);
     }
     return this.parseWithRegex(text);
   }
@@ -27,8 +27,8 @@ class AIService {
   /**
    * ADVANCED: NLP using GPT-4o-mini (highly efficient)
    */
-  async parseWithOpenAI(text, categories = [], phone = null, skipCooldown = false) {
-    logger.debug('Using OpenAI for NLP extraction...');
+  async parseWithOpenAI(text, categories = [], phone = null, skipCooldown = false, systemLang = 'en') {
+    logger.debug(`Using OpenAI for NLP extraction (System Lang: ${systemLang})...`);
 
     const now = new Date();
     // Generate a relative date reference for the last 7 days to eliminate AI math errors
@@ -68,7 +68,9 @@ class AIService {
                       "IMPORTANT: If the payment method is NOT mentioned in the text or visible on the receipt, return `null` for 'payment_method'. Do NOT guess 'Other' or 'WhatsApp'. " +
                       "IMPORTANT: For the 'date' field, only return a date if clearly mentioned or identifiable. If not found, return `null`. " +
                       "IMPORTANT: Extract the currency accurately (e.g., 'MAD', 'EUR', 'USD'). If not mentioned, default to 'MAD'. " +
-                      "Output JSON only: { documentType, status, amount, vat, currency, category, entity, description, monthYear (for statements, MM-YYYY format), payment_method, date (YYYY-MM-DD) }." 
+                      "IMPORTANT: For 'vat', you MUST extract ONLY the percentage rate as a number (e.g., return 2 for 2%, return 20 for 20%). NEVER return the calculated absolute amount. If the user mentions both (e.g. '1000 with 200 tax'), you MUST return the calculated rate (20). " +
+                      `STRICT LANGUAGE CONTROL: The user's system language is ${systemLang.toUpperCase()}. While you can understand the input in any language, all extracted 'category' and 'description' fields MUST be translated into ${systemLang === 'fr' ? 'French' : 'English'} to match the user's interface. ` +
+                      "Output JSON only: { documentType, status, amount, vat, discount, currency, category, entity, description, monthYear (for statements, MM-YYYY format), payment_method, date (YYYY-MM-DD) }." 
           },
           { role: "user", content: text }
         ],
@@ -257,25 +259,25 @@ class AIService {
     return "I paid 350 dollars for fuel today.";
   }
 
-  async extractDetailsFromTranscription(text, phone = null) {
-    return this.parseExpenseText(text, [], phone);
+  async extractDetailsFromTranscription(text, phone = null, systemLang = 'en') {
+    return this.parseExpenseText(text, [], phone, false, systemLang);
   }
 
   /**
    * VISION: Real GPT-4o-mini Vision vs. Mock Fallback
    */
-  async parseReceiptImage(localFilePath, categories = [], phone = null) {
+  async parseReceiptImage(localFilePath, categories = [], phone = null, systemLang = 'en') {
     if (this.openai && phone) {
       const status = await laravelService.checkAiStatus(phone);
       if (!status.allowed) {
         throw new Error(status.message || "AI quota exceeded.");
       }
-      return this.parseWithVision(localFilePath, categories, phone);
+      return this.parseWithVision(localFilePath, categories, phone, systemLang);
     }
     return this.mockVision();
   }
 
-  async parseWithVision(localFilePath, categories = [], phone = null) {
+  async parseWithVision(localFilePath, categories = [], phone = null, systemLang = 'en') {
     const today = new Date().toISOString().split('T')[0];
     const catList = categories.length > 0 ? `Available Categories: [${categories.join(', ')}]. ` : '';
     const model = "gpt-4o-mini";
@@ -307,7 +309,9 @@ class AIService {
                 IMPORTANT: If the payment method is NOT visible, return null. Do NOT guess. 
                 IMPORTANT: For the 'date' field, only return a date if clearly visible. If not found, return null.
 
-                Return JSON: { "documentType", "status", "amount", "vat", "currency", "category", "entity", "description", "monthYear", "payment_method", "date", "invoiceNumber" }`
+                Return JSON: { "documentType", "status", "amount", "vat", "currency", "category", "entity", "description", "monthYear", "payment_method", "date", "invoiceNumber" }
+                
+                STRICT LANGUAGE CONTROL: The user's system language is ${systemLang.toUpperCase()}. While you analyze documents in any language, all extracted 'category' and 'description' fields MUST be translated into ${systemLang === 'fr' ? 'French' : 'English'} to match the user's interface.`
               },
               {
                 type: "image_url",
@@ -460,6 +464,44 @@ class AIService {
   }
 
   /**
+   * Detects if the user is speaking English or French.
+   */
+  async detectLanguage(text, phone = null, skipCooldown = false, systemLang = 'en') {
+    if (!this.openai || !text || text.length < 3) return 'unknown';
+    
+    try {
+        const response = await this.openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+                { 
+                    content: "Analyze the language of the user's message. " +
+                             "If it's English, return 'en'. If it's French, return 'fr'. " +
+                             "If it's a greeting like 'Bonjour', 'Salut', 'Coucou', return 'fr'. " +
+                             "If it's 'Hello', 'Hi', 'Hey', return 'en'. " +
+                             "If it's clearly another language or indistinguishable short noise, return 'unknown'. " +
+                             "Output ONLY the 2-letter code or 'unknown' without any other text." 
+                },
+                { role: "user", content: text }
+            ],
+            max_tokens: 5
+        });
+
+        const result = response.choices[0].message.content.trim().toLowerCase();
+        
+        if (phone && response.usage) {
+            await laravelService.logAiUsage(phone, "gpt-4o-mini", response.usage.prompt_tokens, response.usage.completion_tokens, skipCooldown);
+        }
+
+        if (['en', 'fr', 'unknown'].includes(result)) return result;
+        return 'unknown';
+    } catch (error) {
+        console.error('Language Detection Error:', error.message);
+        return 'unknown';
+    }
+  }
+
+
+  /**
    * FIELD VALIDATOR: Checks if a piece of text is "meaningful" for a specific field.
    * Prevents social chatter/noise from entering the database.
    */
@@ -549,6 +591,53 @@ class AIService {
             });
 
             const result = JSON.parse(completion.choices[0].message.content);
+            
+            // Robust Year Catcher (Regex Fallback if AI misses it)
+            if (!result.year) {
+              const yearMatch = text.match(/\b(20\d{2})\b/);
+              if (yearMatch) result.year = parseInt(yearMatch[1]);
+            }
+            
+            // Robust Month Catcher (Regex Fallback if AI misses it)
+            if (!result.month) {
+              const months = [
+                  ["january", "janvier"], ["february", "février", "fevrier"], ["march", "mars"], ["april", "avril"],
+                  ["may", "mai"], ["june", "juin"], ["july", "juillet"], ["august", "août", "aout"],
+                  ["september", "septembre"], ["october", "octobre"], ["november", "novembre"], ["december", "décembre", "decembre"]
+              ];
+              const lowerText = text.toLowerCase();
+              for (let i = 0; i < months.length; i++) {
+                  if (months[i].some(m => lowerText.includes(m))) {
+                      result.month = i + 1;
+                      break;
+                  }
+              }
+            }
+
+            // Safety Net: If AI incorrectly matched a month as an entity name
+            if (result.entityName) {
+                const monthsLower = [
+                    "january", "janvier", "february", "février", "fevrier", "march", "mars", "april", "avril",
+                    "may", "mai", "june", "juin", "july", "juillet", "august", "août", "aout",
+                    "september", "septembre", "october", "octobre", "november", "novembre", "december", "décembre", "decembre"
+                ];
+                const entityLower = String(result.entityName).toLowerCase();
+                if (monthsLower.includes(entityLower)) {
+                    const allMonths = [
+                      ["january", "janvier"], ["february", "février", "fevrier"], ["march", "mars"], ["april", "avril"],
+                      ["may", "mai"], ["june", "juin"], ["july", "juillet"], ["august", "août", "aout"],
+                      ["september", "septembre"], ["october", "octobre"], ["november", "novembre"], ["december", "décembre", "decembre"]
+                    ];
+                    for (let i = 0; i < allMonths.length; i++) {
+                        if (allMonths[i].includes(entityLower)) {
+                            result.month = i + 1;
+                            result.entityName = null;
+                            break;
+                        }
+                    }
+                }
+            }
+
             return result;
         } catch (error) {
             console.error('AI Report Query Parsing Error:', error);

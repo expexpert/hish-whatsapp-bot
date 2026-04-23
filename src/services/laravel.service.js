@@ -50,49 +50,85 @@ class LaravelService {
     return headers;
   }
 
-  /**
-   * Check if a user is active/linked in the dashboard
-   */
   async checkAuth(phone) {
     try {
       const response = await axios.get(`${this.baseUrl}/customer/profile`, {
         headers: this.getBotHeaders(phone)
       });
-      // If the middleware didn't find the user, data will be null
-      return response.data.data !== null;
+      // Return the full profile data for persistent sync
+      return response.data.data;
     } catch (error) {
       console.error(`❌ [DEBUG] Laravel Auth Check FAIL for ${phone}:`, error.response?.data || error.message);
-      return false;
+      return null;
+    }
+  }
+
+  /**
+   * Update User Profile (specifically language) in the database
+   */
+  async updateLanguage(phone, lang) {
+      try {
+          await axios.put(`${this.baseUrl}/customer/profile`, { bot_lang: lang }, {
+              headers: this.getBotHeaders(phone)
+          });
+          return true;
+      } catch (error) {
+          console.error(`❌ Laravel Update Language FAIL for ${phone}:`, error.response?.data || error.message);
+          return false;
+      }
+  }
+
+  /**
+   * Get available Taxes and Product Resources
+   */
+  async getTaxes(phone) {
+    try {
+      const response = await axios.get(`${this.baseUrl}/customer/product-resources`, {
+        headers: this.getBotHeaders(phone)
+      });
+      return response.data.data || null;
+    } catch (error) {
+      console.error(`❌ [DEBUG] Laravel Get Taxes FAIL for ${phone}:`, error.response?.data || error.message);
+      return null;
     }
   }
 
   /**
    * Get dynamic dashboard stats for a specific phone number
    */
-  async getAccountStatus(phone, targetMonth = null, targetYear = null, clientId = null, supplierId = null) {
+  async getAccountStatus(phone, targetMonth = null, targetYear = null, entityId = null, lang = 'fr') {
     const rawTargetMonth = targetMonth;
     const rawTargetYear = targetYear;
     
     try {
       const now = new Date();
       const currentYear = rawTargetYear || now.getFullYear();
-      const currentMonthIdx = rawTargetMonth ? (parseInt(rawTargetMonth) - 1) : now.getMonth();
-      const monthNum = String(currentMonthIdx + 1).padStart(2, '0');
       
       const params = {};
       
       // Only apply date filters if a specific month/year is requested
-      if (rawTargetMonth || rawTargetYear) {
+      if (rawTargetMonth) {
+          // Both month and year
+          const currentMonthIdx = parseInt(rawTargetMonth) - 1;
+          const monthNum = String(currentMonthIdx + 1).padStart(2, '0');
           const startStr = `${currentYear}-${monthNum}-01`;
           const lastDay = new Date(currentYear, currentMonthIdx + 1, 0).getDate();
           const endStr = `${currentYear}-${monthNum}-${String(lastDay).padStart(2, '0')}`;
           
           params.date_from = startStr;
           params.date_to = endStr;
+      } else if (rawTargetYear) {
+          // Just the year requested -> Get full year
+          params.date_from = `${currentYear}-01-01`;
+          params.date_to = `${currentYear}-12-31`;
       }
 
-      if (clientId) params.client_id = clientId;
-      if (supplierId) params.supplier_id = supplierId;
+      if (entityId) {
+          // If searching for a specific client/supplier dashboard
+          // The PHP backend expects client_id or supplier_id
+          // We don't distinguish type here, but usually, this is used for clients
+          params.client_id = entityId;
+      }
 
       const response = await axios.get(`${this.baseUrl}/customer/dashboard-data`, {
         params: params,
@@ -102,11 +138,16 @@ class LaravelService {
 
       const data = response.data.data;
       
-      // Calculate display period string
-      let periodLabel = "All Time";
-      if (rawTargetMonth || rawTargetYear) {
+      // Calculate display period string (Localized)
+      const locale = lang === 'fr' ? 'fr-FR' : 'en-US';
+      let periodLabel = lang === 'fr' ? "Tout le temps" : "All Time";
+
+      if (rawTargetMonth) {
+          const currentMonthIdx = parseInt(rawTargetMonth) - 1;
           const displayDate = new Date(currentYear, currentMonthIdx, 1);
-          periodLabel = displayDate.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+          periodLabel = displayDate.toLocaleString(locale, { month: 'long', year: 'numeric' });
+      } else if (rawTargetYear) {
+          periodLabel = String(currentYear);
       }
 
       return {
@@ -132,15 +173,28 @@ class LaravelService {
         expenseVat: parseFloat(data.total_expenses_vat) || 0,
         vatPayable: parseFloat(data.total_vat_payable) || 0,
         recentDocuments: [],
-        targetMonth: monthNum,
+        targetMonth: rawTargetMonth ? String(rawTargetMonth).padStart(2, '0') : null,
         targetYear: currentYear
       };
     } catch (error) {
       console.error('Laravel Hybrid Status Error:', error.response?.data || error.message);
+      
+      const currentYear = rawTargetYear || new Date().getFullYear();
+      let periodLabel = "All Time";
+      if (rawTargetMonth) {
+          const currentMonthIdx = parseInt(rawTargetMonth) - 1;
+          const displayDate = new Date(currentYear, currentMonthIdx, 1);
+          periodLabel = displayDate.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+      } else if (rawTargetYear) {
+          periodLabel = String(currentYear);
+      } else {
+          periodLabel = new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' });
+      }
+
       return { 
-        month: new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' }),
-        targetMonth: String(new Date().getMonth() + 1).padStart(2, '0'),
-        targetYear: new Date().getFullYear(),
+        month: periodLabel,
+        targetMonth: rawTargetMonth ? String(rawTargetMonth).padStart(2, '0') : null,
+        targetYear: currentYear,
         status: 'Error fetching data',
         documentsReceived: 0,
         salesSum: 0,
@@ -262,7 +316,7 @@ class LaravelService {
       // Logic for statements: if month/year provided, we could filter by STR_TO_DATE.
       // For now, we'll pass filter if only year provided, or just let backend handle pagination.
       const params = {};
-      if (year && month) params.filter = `${month}-${year}`;
+      if (year && month) params.filter = `${String(month).padStart(2, '0')}-${year}`;
       else if (year) params.filter = year;
 
       const response = await axios.get(`${this.baseUrl}/customer/bank-statements`, {
@@ -372,7 +426,6 @@ class LaravelService {
           
           form.append('date', invoiceDateStr);
           form.append('due_date', dueDate.toISOString().split('T')[0]);
-          form.append('invoice_number', `INV-WA-${Date.now()}`); // Standard API requires unique invoice number
           form.append('status', data.status || 'ISSUED');
 
           // Add a default article so the invoice shows up in the dashboard sums
@@ -381,7 +434,9 @@ class LaravelService {
           form.append('articles[0][quantity]', 1);
           form.append('articles[0][unit_price_ht]', data.amount);
           form.append('articles[0][total_price_ht]', data.amount);
-          form.append('articles[0][tva_percentage]', data.vat || 0);
+          const taxParam = data.tva_id || data.vat || data.tva_percentage || 0;
+          form.append('articles[0][tva_percentage]', taxParam);
+          form.append('tva_percentage', taxParam); // Top-level fallback
 
           if (filePath && fs.existsSync(filePath)) {
               const ext = filePath.toLowerCase();
@@ -429,17 +484,33 @@ class LaravelService {
    * Get Category List for AI Context
    */
   async getCategories(phone = null) {
-      logger.debug(`📂 Fetching Categories for AI Context...`);
-      try {
-      const response = await axios.get(`${this.baseUrl}/customer/transaction-resources`, {
-        headers: this.getBotHeaders(phone)
-      });
-      return response.data.data.categories || [];
-    } catch (error) {
-          console.error('Laravel Hybrid Get Categories Error:', error.response?.data || error.message);
-          return [];
-      }
-  }
+       logger.debug(`📂 Fetching Categories for AI Context...`);
+       try {
+       const response = await axios.get(`${this.baseUrl}/customer/transaction-resources`, {
+         headers: this.getBotHeaders(phone)
+       });
+       return response.data.data.categories || [];
+     } catch (error) {
+           console.error('Laravel Hybrid Get Categories Error:', error.response?.data || error.message);
+           return [];
+       }
+   }
+
+   /**
+    * Get Product List for Interactive Selection
+    */
+   async getProducts(phone = null) {
+       logger.debug(`📦 Fetching Products for AI Context...`);
+       try {
+           const response = await axios.get(`${this.baseUrl}/customer/customer-products`, {
+               headers: this.getBotHeaders(phone)
+           });
+           return response.data.data || [];
+       } catch (error) {
+           console.error('Laravel Hybrid Get Products Error:', error.response?.data || error.message);
+           return [];
+       }
+   }
 
   /**
    * Get Supplier List for Interactive Selection

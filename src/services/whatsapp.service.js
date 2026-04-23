@@ -94,7 +94,7 @@ class WhatsAppService {
       type: 'interactive',
       interactive: {
         type: 'button',
-        body: { text: bodyText },
+        body: { text: bodyText.length > 1024 ? bodyText.substring(0, 1021) + '...' : bodyText },
         action: {
           buttons: buttons.map(btn => ({
             type: 'reply',
@@ -149,7 +149,7 @@ class WhatsAppService {
       type: 'interactive',
       interactive: {
         type: 'list',
-        body: { text: bodyText },
+        body: { text: bodyText.length > 1024 ? bodyText.substring(0, 1021) + '...' : bodyText },
         action: {
           button: buttonText.length > 20 ? buttonText.substring(0, 17) + '...' : buttonText,
           sections: sanitizedSections
