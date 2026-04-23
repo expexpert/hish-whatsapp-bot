@@ -500,14 +500,14 @@ class LaravelService {
     * Get Product List for Interactive Selection
     */
    async getProducts(phone = null) {
-       logger.debug(`📦 Fetching Products for AI Context...`);
+       logger.debug(`📦 Fetching Categories for AI Context...`);
        try {
-           const response = await axios.get(`${this.baseUrl}/customer/customer-products`, {
+           const response = await axios.get(`${this.baseUrl}/customer/product-resources`, {
                headers: this.getBotHeaders(phone)
            });
-           return response.data.data || [];
+           return response.data.data?.categories || [];
        } catch (error) {
-           console.error('Laravel Hybrid Get Products Error:', error.response?.data || error.message);
+           console.error('Laravel Hybrid Get Categories Error:', error.response?.data || error.message);
            return [];
        }
    }
