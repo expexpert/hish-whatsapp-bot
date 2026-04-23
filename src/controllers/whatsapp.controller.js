@@ -2060,16 +2060,16 @@ class WhatsAppController {
     const combined = [
       ...matchedClients.map(c => {
           const name = c.client_name.trim();
-          const prefix = "Clnt: ";
-          const idSuffix = counts[name] > 1 ? ` | ID: ${c.id}` : "";
+          const prefix = "C: ";
+          const idSuffix = counts[name] > 1 ? ` #${c.id}` : "";
           const availableSpace = 20 - prefix.length - idSuffix.length;
           const displayName = name.substring(0, availableSpace).trim();
           return { id: `rep_c_${c.id}`, title: `${prefix}${displayName}${idSuffix}` };
       }),
       ...matchedSuppliers.map(s => {
           const name = s.name.trim();
-          const prefix = "Supp: ";
-          const idSuffix = counts[name] > 1 ? ` | ID: ${s.id}` : "";
+          const prefix = "S: ";
+          const idSuffix = counts[name] > 1 ? ` #${s.id}` : "";
           const availableSpace = 20 - prefix.length - idSuffix.length;
           const displayName = name.substring(0, availableSpace).trim();
           return { id: `rep_s_${s.id}`, title: `${prefix}${displayName}${idSuffix}` };
