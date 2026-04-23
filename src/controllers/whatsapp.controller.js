@@ -710,24 +710,26 @@ class WhatsAppController {
                 
                 // Laravel returns the signed URL in 'download_url'
                 if (result.data) {
+                    // 1. Prioritize the official Generated PDF Report from the backend
                     let downloadUrl = result.data.download_url || result.data.pdf_url || `${config.botPublicUrl}/api/bot/invoice/pdf/${result.data.id}`;
                     
-                    // If an original image was uploaded, prioritize returning it as the visual receipt
-                    if (result.data.document_path) {
+                    // 2. Only fallback to the original 'document' if the report wasn't specifically returned
+                    // but we generally PREFER the report (PDF) for successful submission
+                    if (!result.data.download_url && result.data.document_path) {
                         if (String(result.data.document_path).startsWith('http')) {
                             downloadUrl = result.data.document_path;
                         } else {
-                            const pathBase = String(result.data.document_path).replace('public/', '');
+                            const pathBase = String(result.data.document_path).replace('public/', '').replace('storage/', '');
                             downloadUrl = `${config.botPublicUrl}/storage/${pathBase}`;
                         }
                     }
 
-                    // Rewrite any local routes returned by the backend to use the public ngrok tunnel
-                    if (downloadUrl.includes('localhost') || downloadUrl.includes('127.0.0.1')) {
+                    // 3. CRITICAL: Rewrite any internal routes to the public domain so Meta can reach them
+                    if (downloadUrl && (downloadUrl.includes('localhost') || downloadUrl.includes('127.0.0.1'))) {
                         downloadUrl = downloadUrl.replace(/http(s)?:\/\/(localhost|127\.0\.0\.1):[0-9]+/, config.botPublicUrl);
                     }
                     
-                    const isLocal = false; // We just mapped it to public, so it is safe for Meta
+                    const isLocal = false;
                     
                     try {
                         const date = result.data.date ? new Date(result.data.date).toLocaleDateString(state.lang === 'fr' ? 'fr-FR' : 'en-GB') : 'N/A';
@@ -1413,12 +1415,15 @@ class WhatsAppController {
             stateService.setUserState(from, 'AWAITING_INVOICE_STATUS', { filePath, invoiceData: inv });
             await this.sendInvoiceStatusButtons(from);
         } else {
-            logger.debug(`[DEBUG ROUTING] product_id: ${inv.product_id}, tva_id: ${inv.tva_id}, typeof product_id: ${typeof inv.product_id}`);
+            /* 
+            // Skipping Product/Category selection as requested (not mandatory in backend)
             if (!inv.product_id) {
                 const products = await fetchProducts();
                 stateService.setUserState(from, 'AWAITING_INVOICE_PRODUCT', { filePath, invoiceData: inv });
                 await this.sendProductSelectionList(from, products);
-            } else if (!inv.tva_id) {
+            } else 
+            */
+            if (!inv.tva_id) {
                 stateService.setUserState(from, 'AWAITING_INVOICE_VAT', { invoiceData: inv, filePath });
                 await this.sendVatSelectionList(from);
             } else {
