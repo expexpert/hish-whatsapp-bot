@@ -1011,28 +1011,10 @@ class WhatsAppController {
             return this.handleDocumentRouting(from, state.data.invoiceData, state.data.filePath, 'interactive');
         }
 
-        // --- Handle Invoice Product Selection ---
-        if (state.state === 'AWAITING_INVOICE_PRODUCT' && !detectedIntent) {
-            const productId = (interactiveId && String(interactiveId).startsWith('inv_p_')) ? String(interactiveId).replace('inv_p_', '') : null;
-            if (productId) {
-                state.data.invoiceData.product_id = parseInt(productId);
-                // If it's a specific product, use its title as the designation if not already set
-                if (!state.data.invoiceData.description || state.data.invoiceData.description === 'No description') {
-                    state.data.invoiceData.description = text;
-                }
-            } else {
-                 // Text entry fallback - try to resolve
-                 const match = await this.resolveProductFromName(from, text);
-                 if (match) {
-                     state.data.invoiceData.product_id = match.id;
-                 } else {
-                     // If still no match, we keep it as a designation but product_id remains missing
-                     // which will re-trigger the selection list in routing.
-                     state.data.invoiceData.description = text;
-                 }
-            }
-            await stateService.setUserState(from, state.state, state.data);
-            return this.handleDocumentRouting(from, state.data.invoiceData, state.data.filePath, 'interactive');
+        // --- Handle Invoice Product Selection (DISABLED - Skipping to Next Step) ---
+        if (state.state === 'AWAITING_INVOICE_PRODUCT') {
+            logger.debug('⏭️ Bypassing Product Selection state (skipping to routing)');
+            return this.handleDocumentRouting(from, state.data.invoiceData, state.data.filePath, 'text');
         }
 
         // --- Handle Expense Payment Method Selection ---
