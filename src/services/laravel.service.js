@@ -601,15 +601,16 @@ class LaravelService {
    * Get Supplier List for Interactive Selection
    */
   async getSuppliers(phone) {
-      const url = `${this.baseUrl}/customer/transaction-resources?sort=recent`;
+      const url = `${this.baseUrl}/customer/customer-suppliers?sort=recent`;
       logger.debug(`🚚 Fetching Suppliers: ${url}`);
       try {
       const response = await axios.get(url, {
+        timeout: 15000,
         headers: this.getBotHeaders(phone)
       });
-      const suppliers = response.data.data.suppliers || [];
-      logger.debug(`✅ Found ${suppliers.length} suppliers for ${phone}`);
-      return suppliers;
+      const count = response.data.data ? response.data.data.length : 0;
+      logger.debug(`✅ Found ${count} suppliers for ${phone}`);
+      return response.data.data || [];
     } catch (error) {
           console.error(`❌ Laravel Get Suppliers FAIL: ${url}`, error.response?.data || error.message);
           return [];
