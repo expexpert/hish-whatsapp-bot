@@ -859,13 +859,13 @@ class WhatsAppController {
             stateService.setUserState(from, 'AWAITING_DESCRIPTION_EDIT' + nextStateSuffix, state.data);
             await whatsappService.sendTextMessage(from, t('prompt_edit_notes', state.lang));
           } else if (interactiveId === 'btn_edit_status' || interactiveId === 'status' || textLower === 'status') {
-            // Priority: Check if we are in an edit state to prevent global intent switching
+            // Only invoices support manual status changes (Paid/Unpaid)
             if (isInvoice) {
                 stateService.setUserState(from, 'AWAITING_INVOICE_STATUS', state.data);
                 await this.sendInvoiceStatusButtons(from);
             } else {
-                stateService.setUserState(from, 'AWAITING_EXPENSE_STATUS', state.data);
-                await this.sendExpenseStatusButtons(from);
+                // For expenses, just confirm they are validated
+                await whatsappService.sendTextMessage(from, state.lang === 'fr' ? "✅ Les dépenses sont validées automatiquement lors de l'enregistrement." : "✅ Expenses are validated automatically upon recording.");
             }
           } else if (interactiveId === 'all' || textLower === 're-submit entry') {
             stateService.setUserState(from, 'IDLE');
@@ -1592,9 +1592,6 @@ class WhatsAppController {
         } else if (!exp.payment_method || invalidVals.includes(String(exp.payment_method).toLowerCase()) || String(exp.payment_method).toLowerCase() === 'whatsapp') {
             stateService.setUserState(from, 'AWAITING_EXPENSE_PAYMENT_METHOD', { expenseData: exp, receiptPath: filePath });
             await this.sendPaymentMethodSelectionList(from, 'EXPENSE');
-        } else if (!exp.status || invalidVals.includes(String(exp.status).toLowerCase())) {
-            stateService.setUserState(from, 'AWAITING_EXPENSE_STATUS', { expenseData: exp, receiptPath: filePath });
-            await this.sendExpenseStatusButtons(from);
         } else if (!exp.tva_id) {
             // Attempt auto-resolution if we have a rate but no ID
             if (exp.vat) {
@@ -1955,7 +1952,6 @@ class WhatsAppController {
       `*${t('field_entity_supplier', state.lang)}:* ${expenseData.supplier_name || expenseData.entity || '...'}\n` +
       `*${t('field_category', state.lang)}:* ${expenseData.category || '...'}\n` +
       `*${t('field_payment', state.lang)}:* ${localizedPayment}\n` +
-      `*${t('field_status', state.lang)}:* ${expenseData.status || '...'}\n` +
       `*${t('field_notes', state.lang)}:* ${notes}\n\n`;
 
     if (receiptPath) {
@@ -2060,7 +2056,9 @@ class WhatsAppController {
       rows.splice(3, 0, { id: 'cat', title: t('field_category', state.lang) });
     }
 
-    rows.push({ id: 'btn_edit_status', title: t('field_status', state.lang) });
+    if (isInvoice) {
+      rows.push({ id: 'btn_edit_status', title: t('field_status', state.lang) });
+    }
     rows.push({ id: 'desc', title: isInvoice ? t('field_notes', state.lang) : t('field_description', state.lang) });
     rows.push({ id: 'all', title: t('btn_resubmit', state.lang) });
     
@@ -2409,20 +2407,45 @@ class WhatsAppController {
 
       if (responseType === 'INTEGER' || responseType === 'DECIMAL') {
         const stats = await laravelService.getAccountStatus(from, filters.month, filters.year, entity.id, state.lang);
+        const lang = state.lang;
+        const labels = {
+            en: { 
+                vat: "VAT Collected", unpaid: "Unpaid Total", expenses: "Total Expenses", 
+                revenue: "Total Revenue", clients: "Total Clients",
+                invoices_count: "Number of Invoices", expenses_count: "Number of Expenses",
+                total_count: "Total Documents", balance: "Net Balance"
+            },
+            fr: { 
+                vat: "TVA collectée", unpaid: "Total impayé", expenses: "Total des dépenses", 
+                revenue: "Total des revenus", clients: "Nombre de clients",
+                invoices_count: "Nombre de factures", expenses_count: "Nombre de dépenses",
+                total_count: "Total des documents", balance: "Solde Net"
+            }
+        };
+        const l = labels[lang] || labels.en;
+        const periodStr = (filters.startDate && filters.endDate) ? `${filters.startDate} - ${filters.endDate}` : `${monthName} ${filters.year}`;
+
         if (responseType === 'INTEGER') {
           let count = stats.totalDocuments;
-          if (filters.field === 'unpaid') count = stats.invoicesCount;
-          else if (filters.dataType === 'expenses') count = stats.expensesCount;
-          else if (filters.dataType === 'invoices') count = stats.invoicesCount;
-          return whatsappService.sendTextMessage(from, `${count}`);
+          let fieldKey = 'total_count';
+          if (filters.field === 'unpaid') { count = stats.invoicesCount; fieldKey = 'unpaid'; }
+          else if (filters.dataType === 'expenses') { count = stats.expensesCount; fieldKey = 'expenses_count'; }
+          else if (filters.dataType === 'invoices') { count = stats.invoicesCount; fieldKey = 'invoices_count'; }
+          
+          return whatsappService.sendTextMessage(from, `📊 *${l[fieldKey]} (${periodStr}):* ${count}`);
         }
+        
         if (responseType === 'DECIMAL') {
           let sum = stats.salesSum - stats.expensesSum;
-          if (filters.field === 'vat') sum = stats.cash_vat_sum;
-          else if (filters.field === 'revenue') sum = stats.salesSum;
-          else if (filters.field === 'expenses') sum = stats.expensesSum;
-          else if (filters.field === 'unpaid') sum = stats.total_unpaid_sum;
-          return whatsappService.sendTextMessage(from, `${sum.toFixed(2)}`);
+          let fieldKey = 'balance';
+          
+          if (filters.field === 'vat') { sum = stats.cash_vat_sum; fieldKey = 'vat'; }
+          else if (filters.field === 'revenue') { sum = stats.salesSum; fieldKey = 'revenue'; }
+          else if (filters.field === 'expenses') { sum = stats.expensesSum; fieldKey = 'expenses'; }
+          else if (filters.field === 'unpaid') { sum = stats.total_unpaid_sum; fieldKey = 'unpaid'; }
+          
+          const formatted = new Intl.NumberFormat(lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(sum);
+          return whatsappService.sendTextMessage(from, `📊 *${l[fieldKey]} (${periodStr}):* ${formatted} ${state.currency || 'MAD'}`);
         }
       }
 
@@ -2829,10 +2852,12 @@ class WhatsAppController {
         transactions.sort((a, b) => new Date(b.date || b.issue_date || b.created_at) - new Date(a.date || a.issue_date || a.created_at));
         title = state.lang === 'fr' ? 'Toutes les Transactions' : 'All Transactions';
       } else if (type === 'inv') {
-        transactions = await laravelService.getInvoices(from, status, month, year, entityId, startDate, endDate);
+        const invs = await laravelService.getInvoices(from, status, month, year, entityId, startDate, endDate);
+        transactions = invs.map(i => ({ ...i, bot_type: 'inv' }));
         title = status === 'unpaid' ? (state.lang === 'fr' ? 'Factures Impayées' : 'Unpaid Invoices') : t('recent_invoices', state.lang);
       } else {
-        transactions = await laravelService.getExpenses(from, month, year, entityId, startDate, endDate);
+        const exps = await laravelService.getExpenses(from, month, year, entityId, startDate, endDate);
+        transactions = exps.map(e => ({ ...e, bot_type: 'exp' }));
         title = t('recent_expenses', state.lang);
       }
       
@@ -2933,14 +2958,15 @@ class WhatsAppController {
           amount = parseFloat(transaction.total_ttc || transaction.ttc || transaction.amount || 0);
         }
 
-        const icon = transaction.bot_type === 'exp' ? '🏷️' : ((transaction.status || "").toLowerCase() === 'paid' ? '🟢' : '🔴');
+        const isExp = transaction.bot_type === 'exp';
+        const icon = isExp ? '🏷️' : ((transaction.status || "").toLowerCase() === 'paid' ? '🟢' : '🔴');
         const fmtAmount = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + (transaction.currency || currency);
-        const prefix = type === 'inv' ? 'v_inv_' : 'v_exp_';
+        const prefix = isExp ? 'v_exp_' : 'v_inv_';
 
         return {
            id: `${prefix}${transaction.id}`,
            title: `${icon} ${date} — ${fmtAmount}`,
-           description: transaction.notes || (type === 'inv' ? t('field_invoice_num', state.lang) + ` Ref: ${transaction.id}` : t('field_expense_num', state.lang) + ` Ref: ${transaction.id}`)
+           description: transaction.notes || (isExp ? t('field_expense_num', state.lang) : t('field_invoice_num', state.lang)) + ` Ref: ${transaction.id}`
         };
       });
 
@@ -2954,9 +2980,11 @@ class WhatsAppController {
       }
 
       const fmtTotal = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(totalSum) + ' ' + currency;
+      const totalLabel = (type === 'inv') ? t('field_total_ht', state.lang) : t('field_total_ttc', state.lang);
+
       const bodyText = `*${title}*\n` +
                        `📅 *${t('field_period', state.lang)}:* ${periodLabel}\n` +
-                       `💰 *Total (HT):* ${fmtTotal}\n\n` +
+                       `💰 *${totalLabel}:* ${fmtTotal}\n\n` +
                        t('records_found_msg', state.lang, { count: totalCount }) + 
                        (totalPages > 1 ? ` (Page ${page}/${totalPages})` : "");
 
