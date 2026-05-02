@@ -2951,6 +2951,14 @@ class WhatsAppController {
       // 4. Calculate Total Sum (On the final filtered list)
       let totalSum = 0;
       let currency = 'MAD';
+
+      // Fetch tax resources to map ID to rate
+      const taxResources = await laravelService.getTaxes(from);
+      const taxMap = {};
+      if (taxResources && taxResources.tax) {
+          taxResources.tax.forEach(t => taxMap[t.id] = parseFloat(t.rate || 0));
+      }
+
       transactions.forEach((transaction) => {
           let amount = 0;
           if (transaction.bot_type === 'inv') {
@@ -2966,8 +2974,9 @@ class WhatsAppController {
                   const tva = articles.reduce((sum, art) => {
                       const p = parseFloat(art.total_price_ht || art.price_ht || 0);
                       const d = parseFloat(art.discount || 0);
-                      const r = parseFloat(art.tva_percentage || 0); // Note: This assumes simple rate, which is fine for summary
-                      return sum + ((p - d) * (r / 100));
+                      const rawRate = parseFloat(art.tva_percentage || 0);
+                      const rate = taxMap[rawRate] !== undefined ? taxMap[rawRate] : rawRate;
+                      return sum + ((p - d) * (rate / 100));
                   }, 0);
                   amount = ht + tva;
               } else {
