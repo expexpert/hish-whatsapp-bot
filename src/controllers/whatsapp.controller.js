@@ -2236,12 +2236,13 @@ class WhatsAppController {
       const isUnpaidSearch = filters.field === 'unpaid' || textLower.includes('unpaid') || textLower.includes('impay');
       const isAllTime = isAllTimeExplicit || isUnpaidSearch;
       
-      if (isAllTime && !filters.month && !filters.startDate) {
+      // Force clear filters if it's an All-Time search, even if AI pre-filled them (prevents "None found" fallback)
+      if (isAllTime && !text.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|janv|fév|mars|avr|mai|juin|juil|août|sept|oct|nov|déc)\b/i)) {
           filters.month = null;
           filters.year = null;
           filters.startDate = null;
           filters.endDate = null;
-          logger.debug(`🕒 [TIME OVERRIDE] "All Time" forced for Unpaid/Total query.`);
+          logger.debug(`🕒 [TIME OVERRIDE] "All Time" forced for Unpaid/Total query. Clearing pre-filled date filters.`);
       }
 
       // General status report
