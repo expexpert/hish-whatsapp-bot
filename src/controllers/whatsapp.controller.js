@@ -2230,14 +2230,18 @@ class WhatsAppController {
           filters.dataType = 'invoices';
       }
 
-      // 🔄 ALL TIME DETECTION: If user asks for 'total' or 'all time', override date filters
-      const isAllTime = textLower.includes('all time') || textLower.includes('tout le temps') || textLower.includes('total') || textLower.includes('historique') || textLower.includes('history');
-      if (isAllTime) {
+      // 🔄 ALL TIME DETECTION: If user asks for 'total', 'all time' OR 'unpaid' without a date, override date filters
+      const allTimeKeywords = (t('keywords_all_time', state.lang) || "").split(',').map(k => k.trim()).filter(k => k.length > 0);
+      const isAllTimeExplicit = allTimeKeywords.some(k => textLower.includes(k));
+      const isUnpaidSearch = filters.field === 'unpaid' || textLower.includes('unpaid') || textLower.includes('impay');
+      const isAllTime = isAllTimeExplicit || isUnpaidSearch;
+      
+      if (isAllTime && !filters.month && !filters.startDate) {
           filters.month = null;
           filters.year = null;
           filters.startDate = null;
           filters.endDate = null;
-          logger.debug(`🕒 [TIME OVERRIDE] "All Time" detected in query. Clearing date filters.`);
+          logger.debug(`🕒 [TIME OVERRIDE] "All Time" forced for Unpaid/Total query.`);
       }
 
       // General status report
@@ -3001,7 +3005,10 @@ class WhatsAppController {
       }
 
       const fmtTotal = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(totalSum) + ' ' + currency;
-      const totalLabel = (type === 'inv') ? t('field_total_ht', state.lang) : t('field_total_ttc', state.lang);
+      let totalLabel = (type === 'inv') ? t('field_total_ht', state.lang) : t('field_total_ttc', state.lang);
+      if (status === 'UNPAID' || (localFilter && localFilter.toString().includes('PAID'))) {
+          totalLabel = t('total_pending', state.lang);
+      }
 
       const bodyText = `*${title}*\n` +
                        `📅 *${t('field_period', state.lang)}:* ${periodLabel}\n` +
@@ -3107,6 +3114,8 @@ class WhatsAppController {
       const rawNotes = document.notes || document.description;
       const notesText = (rawNotes && String(rawNotes).toLowerCase() !== 'null') ? rawNotes : 'N/A';
       const vatLabel = state.lang === 'fr' ? 'TVA' : 'VAT';
+      const isUnpaid = (document.status || "").toUpperCase() === 'ISSUED';
+      const htLabel = isUnpaid ? t('total_pending', state.lang) : `Total ${type === 'inv' ? 'HT' : 'TTC'}`;
 
       // Human-friendly status mapping
       let displayStatus = document.status || t('recorded_successfully_short', state.lang);
@@ -3119,7 +3128,7 @@ class WhatsAppController {
       const successText = `🧾 *${t('media_doc_title', state.lang, { label: label.toUpperCase() })}*\n` +
                           `━━━━━━━━━━━━━━━━━━\n` +
                           `🏢 *${entityLabelText}:* ${entityName}\n` +
-                          `💰 *Total HT:* ${fmtHT}\n` +
+                          `💰 *${htLabel}:* ${fmtHT}\n` +
                           `📉 *${vatLabel} (${tvaRate}%):* ${fmtVat}\n` +
                           `💵 *Total TTC:* ${fmtTTC}\n` +
                           `📅 *${t('field_date', state.lang)}:* ${date}\n` +
