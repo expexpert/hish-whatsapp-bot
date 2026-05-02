@@ -2412,8 +2412,8 @@ class WhatsAppController {
 
     // 1. Strict Pass (Substring match)
     const search = filters.entityName.toLowerCase().replace(/[.,!?;:]+$/, "").trim();
-    let matchedClients = (clients || []).filter(c => c.client_name.toLowerCase().includes(search));
-    let matchedSuppliers = (suppliers || []).filter(s => s.name.toLowerCase().includes(search));
+    let matchedClients = (clients || []).filter(c => (c.client_name || c.name || "").toLowerCase().includes(search));
+    let matchedSuppliers = (suppliers || []).filter(s => (s.supplier_name || s.company_name || s.name || "").toLowerCase().includes(search));
 
     // 2. Fuzzy Fallback (If no strict matches found)
     if (matchedClients.length === 0 && matchedSuppliers.length === 0) {
@@ -2421,12 +2421,12 @@ class WhatsAppController {
         const threshold = 0.45; // 45% similarity for names is usually safe
         
         const fuzzyClients = (clients || [])
-            .map(c => ({ ...c, score: this.calculateSimilarity(search, c.client_name) }))
+            .map(c => ({ ...c, score: this.calculateSimilarity(search, c.client_name || c.name || "") }))
             .filter(c => c.score >= threshold)
             .sort((a, b) => b.score - a.score);
 
         const fuzzySuppliers = (suppliers || [])
-            .map(s => ({ ...s, score: this.calculateSimilarity(search, s.name) }))
+            .map(s => ({ ...s, score: this.calculateSimilarity(search, s.supplier_name || s.company_name || s.name || "") }))
             .filter(s => s.score >= threshold)
             .sort((a, b) => b.score - a.score);
 
@@ -2531,7 +2531,8 @@ class WhatsAppController {
     ];
 
     if (combined.length === 0) {
-        return whatsappService.sendTextMessage(from, t('no_results_found', lang));
+        const entityName = filters?.field || 'Clients/Suppliers';
+        return whatsappService.sendTextMessage(from, t('error_no_match', lang, { name: entityName }));
     }
 
 
