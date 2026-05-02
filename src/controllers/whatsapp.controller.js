@@ -2236,13 +2236,30 @@ class WhatsAppController {
       const isUnpaidSearch = filters.field === 'unpaid' || textLower.includes('unpaid') || textLower.includes('impay');
       const isAllTime = isAllTimeExplicit || isUnpaidSearch;
       
-      // Force clear filters if it's an All-Time search, even if AI pre-filled them (prevents "None found" fallback)
-      if (isAllTime && !text.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|janv|fév|mars|avr|mai|juin|juil|août|sept|oct|nov|déc)\b/i)) {
+      // 🕵️ DOUBLE SAFETY: If user asked for 'week' but AI only gave 'month', force clear filters to allow range detection
+      const isWeekSearch = textLower.includes('week') || textLower.includes('semaine');
+      
+      // Force clear filters if it's an All-Time search or Week search, even if AI pre-filled them
+      if ((isAllTime || isWeekSearch) && !text.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|janv|fév|mars|avr|mai|juin|juil|août|sept|oct|nov|déc)\b/i)) {
           filters.month = null;
           filters.year = null;
           filters.startDate = null;
           filters.endDate = null;
-          logger.debug(`🕒 [TIME OVERRIDE] "All Time" forced for Unpaid/Total query. Clearing pre-filled date filters.`);
+          logger.debug(`🕒 [TIME OVERRIDE] "All Time" or "Week" forced. Clearing pre-filled date filters.`);
+      }
+
+      // 📅 MANUAL WEEK FALLBACK: If AI missed the dates for a week search, calculate them here
+      if (isWeekSearch && !filters.startDate) {
+          const now = new Date();
+          const day = now.getDay() || 7; // Get current day (1-7, Mon-Sun)
+          const monday = new Date(now);
+          monday.setDate(now.getDate() - (day - 1));
+          const sunday = new Date(monday);
+          sunday.setDate(monday.getDate() + 6);
+          
+          filters.startDate = monday.toISOString().split('T')[0];
+          filters.endDate = sunday.toISOString().split('T')[0];
+          logger.debug(`📅 [WEEK FALLBACK] Manually set range: ${filters.startDate} to ${filters.endDate}`);
       }
 
       // General status report
@@ -2259,7 +2276,7 @@ class WhatsAppController {
           
           let total = 0;
           if (filters.field === 'vat') {
-              total = reportData.cash_vat_sum || 0;
+              total = reportData.salesVat || 0; // Force Gross Sales VAT (100.00)
           } else if (filters.field === 'unpaid') {
               total = reportData.total_unpaid_sum || 0;
           } else if (filters.field === 'expenses') {
