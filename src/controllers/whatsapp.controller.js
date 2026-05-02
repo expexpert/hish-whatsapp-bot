@@ -2232,6 +2232,7 @@ class WhatsAppController {
 
       // 🔄 ALL TIME DETECTION: If user asks for 'all time' OR 'unpaid' without a date, let AI handle it.
       // Removed aggressive manual overrides as AI is now reliable for date extraction.
+      const isWeekSearch = textLower.includes('week') || textLower.includes('semaine');
 
 
       // 📅 MANUAL WEEK FALLBACK: If AI missed the dates for a week search, calculate them here
