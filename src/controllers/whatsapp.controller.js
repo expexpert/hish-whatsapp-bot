@@ -2230,6 +2230,16 @@ class WhatsAppController {
           filters.dataType = 'invoices';
       }
 
+      // 🔄 ALL TIME DETECTION: If user asks for 'total' or 'all time', override date filters
+      const isAllTime = textLower.includes('all time') || textLower.includes('tout le temps') || textLower.includes('total') || textLower.includes('historique') || textLower.includes('history');
+      if (isAllTime) {
+          filters.month = null;
+          filters.year = null;
+          filters.startDate = null;
+          filters.endDate = null;
+          logger.debug(`🕒 [TIME OVERRIDE] "All Time" detected in query. Clearing date filters.`);
+      }
+
       // General status report
       const stats = await laravelService.getAccountStatus(from, filters.month, filters.year, null, state.lang, filters.startDate, filters.endDate);
       
@@ -2296,7 +2306,9 @@ class WhatsAppController {
           };
           
           let fieldKey = 'revenue';
-          if (responseType === 'INTEGER') {
+          if (filters.field === 'clients') {
+              fieldKey = 'clients';
+          } else if (responseType === 'INTEGER') {
               if (filters.dataType === 'expenses') fieldKey = 'expenses_count';
               else if (filters.dataType === 'invoices') fieldKey = 'invoices_count';
               else fieldKey = 'total_count';
@@ -2304,7 +2316,6 @@ class WhatsAppController {
               if (filters.field === 'vat') fieldKey = 'vat';
               else if (filters.field === 'unpaid') fieldKey = 'unpaid';
               else if (filters.field === 'expenses') fieldKey = 'expenses';
-              else if (filters.field === 'clients') fieldKey = 'clients';
           }
           
           const l = labels[lang] || labels.en;
@@ -2319,7 +2330,9 @@ class WhatsAppController {
             ? displayTotal 
             : displayTotal.toLocaleString(lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-          const msg = `📊 *${l[fieldKey]} (${periodStr}):* ${formattedTotal}${suffix}`;
+          // 🎨 PREMIUM MESSAGING: Clean & Direct SaaS Format
+          const msg = `📊 *${l[fieldKey]}:* \`${formattedTotal}${suffix}\`\n` +
+                      `📅 *${lang === 'fr' ? 'Période' : 'Period'}:* \`${periodStr}\``;
 
           return whatsappService.sendTextMessage(from, msg);
       }
@@ -2935,7 +2948,11 @@ class WhatsAppController {
           let amount = 0;
           if (transaction.bot_type === 'inv') {
               const articles = transaction.articles || transaction.items || transaction.invoice_products || [];
-              amount = articles.reduce((sum, art) => sum + parseFloat(art.total_price_ht || art.price_ht || 0), 0);
+              amount = articles.reduce((sum, art) => {
+                  const ht = parseFloat(art.total_price_ht || art.price_ht || 0);
+                  const disc = parseFloat(art.discount || 0);
+                  return sum + (ht - disc);
+              }, 0);
               if (amount === 0) amount = parseFloat(transaction.amount || transaction.total || 0);
           } else {
               amount = parseFloat(transaction.total_ttc || transaction.ttc || transaction.amount || 0);
@@ -2951,7 +2968,11 @@ class WhatsAppController {
         let amount = 0;
         if (type === 'inv') {
           const articles = transaction.articles || transaction.items || transaction.invoice_products || [];
-          amount = articles.reduce((sum, art) => sum + parseFloat(art.total_price_ht || art.price_ht || 0), 0);
+          amount = articles.reduce((sum, art) => {
+            const ht = parseFloat(art.total_price_ht || art.price_ht || 0);
+            const disc = parseFloat(art.discount || 0);
+            return sum + (ht - disc);
+          }, 0);
           // Fallback if articles are empty or zero
           if (amount === 0) amount = parseFloat(transaction.amount || transaction.total || 0);
         } else {
@@ -3044,7 +3065,11 @@ class WhatsAppController {
 
       if (type === 'inv') {
         const articles = document.articles || document.items || document.invoice_products || [];
-        amountHT = articles.reduce((sum, art) => sum + parseFloat(art.total_price_ht || art.price_ht || 0), 0) || parseFloat(document.amount || 0);
+        amountHT = articles.reduce((sum, art) => {
+            const ht = parseFloat(art.total_price_ht || art.price_ht || 0);
+            const disc = parseFloat(art.discount || 0);
+            return sum + (ht - disc);
+        }, 0) || parseFloat(document.amount || 0);
         
         // Priority 1: Backend Pre-calculated Fields (for Consistency)
         tvaAmount = parseFloat(document.total_vat_payable || document.total_tva || document.total_tax || document.tax_amount || document.tax_price || 0);
@@ -3079,7 +3104,8 @@ class WhatsAppController {
 
       const entityName = type === 'inv' ? (document.client?.client_name || 'N/A') : (document.supplier?.supplier_name || 'N/A');
       const entityLabelText = type === 'inv' ? t('label_client', state.lang) : t('label_supplier', state.lang);
-      const notesText = document.notes || document.description || 'N/A';
+      const rawNotes = document.notes || document.description;
+      const notesText = (rawNotes && String(rawNotes).toLowerCase() !== 'null') ? rawNotes : 'N/A';
       const vatLabel = state.lang === 'fr' ? 'TVA' : 'VAT';
 
       // Human-friendly status mapping

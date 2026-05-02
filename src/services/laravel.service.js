@@ -268,6 +268,7 @@ class LaravelService {
         total_expenses_sum: parseFloat(data.bot_total_sum) || 0,
         expenseVat: parseFloat(data.bot_total_tva) || 0,
         vatPayable: parseFloat(data.total_vat_payable) || 0,
+        total_clients_count: parseInt(data.total_clients_count) || 0,
         recentDocuments: [],
         targetMonth: monthNum,
         targetYear: currentYear
