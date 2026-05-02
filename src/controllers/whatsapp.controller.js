@@ -2526,13 +2526,17 @@ class WhatsAppController {
       ...matchedSuppliers.map(s => {
           const name = (s.supplier_name || s.company_name || s.name || "Unnamed Supplier").trim();
           const idSuffix = counts[name] > 1 ? ` #${s.id}` : "";
-          return { id: `rep_s_${s.id}`, title: `S: ${name}${idSuffix}`.substring(0, 24) };
+          const prefix = lang === 'fr' ? 'F' : 'S';
+          return { id: `rep_s_${s.id}`, title: `${prefix}: ${name}${idSuffix}`.substring(0, 24) };
       })
     ];
 
     if (combined.length === 0) {
-        const entityName = filters?.field || 'Clients/Suppliers';
-        return whatsappService.sendTextMessage(from, t('error_no_match', lang, { name: entityName }));
+        if (!filters.entityName) {
+            const emptyKey = filters.field === 'suppliers' ? 'alert_no_suppliers' : 'alert_no_clients';
+            return whatsappService.sendTextMessage(from, t(emptyKey, lang));
+        }
+        return whatsappService.sendTextMessage(from, t('error_no_match', lang, { name: filters.entityName }));
     }
 
 
