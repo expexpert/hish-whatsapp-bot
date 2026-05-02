@@ -2992,19 +2992,15 @@ class WhatsAppController {
                   return sum + (p - d);
               }, 0);
               
-              if (isUnpaidList) {
-                  // For Unpaid lists, sum up the TTC (Total Net Payable)
-                  const tva = articles.reduce((sum, art) => {
-                      const p = parseFloat(art.total_price_ht || art.price_ht || 0);
-                      const d = parseFloat(art.discount || 0);
-                      const rawRate = parseFloat(art.tva_percentage || 0);
-                      const rate = taxMap[rawRate] !== undefined ? taxMap[rawRate] : rawRate;
-                      return sum + ((p - d) * (rate / 100));
-                  }, 0);
-                  amount = ht + tva;
-              } else {
-                  amount = ht;
-              }
+              // Calculate TTC for the total sum header
+              const tva = articles.reduce((sum, art) => {
+                  const p = parseFloat(art.total_price_ht || art.price_ht || 0);
+                  const d = parseFloat(art.discount || 0);
+                  const rawRate = parseFloat(art.tva_percentage || 0);
+                  const rate = taxMap[rawRate] !== undefined ? taxMap[rawRate] : rawRate;
+                  return sum + ((p - d) * (rate / 100));
+              }, 0);
+              amount = ht + tva;
               
               if (amount === 0) amount = parseFloat(transaction.amount || transaction.total || 0);
           } else {
