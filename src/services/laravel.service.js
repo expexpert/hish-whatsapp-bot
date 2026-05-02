@@ -167,11 +167,12 @@ class LaravelService {
         expensesCount: parseInt(data.total_expenses_count) || 0,
 
         // Core Financials (Mapped to Main Branch Logic)
-        salesSum: parseFloat(data.total_ht_sum) || 0,
+        salesSum: parseFloat(data.total_issued_paid_sum) || 0, // Revenue is now TTC to match invoices
         cash_revenue_sum: parseFloat(data.total_paid_sum) || 0,
         total_unpaid_sum: parseFloat(data.unpaidInvoiceSum) || 0,
         total_quote_sum: parseFloat(data.total_quote_sum) || 0,
-        cash_vat_sum: parseFloat(data.total_vat_payable) || 0,
+        cash_vat_sum: parseFloat(data.vat_collected) || 0, // Now strictly Gross Sales VAT
+        salesVat: parseFloat(data.vat_collected) || 0,
         total_paid_sum: parseFloat(data.total_paid_sum) || 0,
         
         pendingReviewCount: parseInt(data.total_pending_review_count) || 0,
@@ -258,7 +259,8 @@ class LaravelService {
         cash_revenue_sum: parseFloat(data.total_paid_sum) || 0,
         total_unpaid_sum: parseFloat(data.unpaidInvoiceSum) || 0,
         total_quote_sum: parseFloat(data.total_quote_sum) || 0,
-        cash_vat_sum: parseFloat(data.total_vat_payable) || 0,
+        cash_vat_sum: parseFloat(data.vat_collected) || 0,
+        salesVat: parseFloat(data.vat_collected) || 0,
         total_paid_sum: parseFloat(data.total_paid_sum) || 0,
         
         pendingReviewCount: parseInt(data.total_pending_review_count) || 0,
