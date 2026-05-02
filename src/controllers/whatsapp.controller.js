@@ -2383,6 +2383,12 @@ class WhatsAppController {
         return this.handleListTransactions(from, 'inv', null, filters.month, filters.year, filters.startDate, filters.endDate, 1, filters.limit, status, localFilter);
       } else if (filters.dataType === 'all') {
         return this.handleListTransactions(from, 'all', null, filters.month, filters.year, filters.startDate, filters.endDate, 1, filters.limit, status, localFilter);
+      } else if (filters.field === 'clients' && responseType === 'ARRAY') {
+        const [clients, suppliers] = await Promise.all([
+          laravelService.getClients(from),
+          laravelService.getSuppliers(from)
+        ]);
+        return this.sendEntityDisambiguation(from, clients, suppliers, state.lang, true); // true for 'global list' mode
       }
 
       await whatsappService.sendTextMessage(from, t('fetching_status', state.lang));
@@ -2495,9 +2501,11 @@ class WhatsAppController {
 
       return this.sendFilteredReport(from, entity, isClient, filters);
     }
+    
+    return this.sendEntityDisambiguation(from, matchedClients, matchedSuppliers, state.lang, false, filters);
+  }
 
-    // DISAMBIGUATION: Multiple matches found
-    // Count occurrences of each name to detect collisions
+  async sendEntityDisambiguation(from, matchedClients, matchedSuppliers, lang, isGlobal = false, filters = null) {
     const counts = {};
     [...matchedClients, ...matchedSuppliers].forEach(e => {
         const name = (e.client_name || e.name || 'Unknown').trim();
@@ -2507,29 +2515,40 @@ class WhatsAppController {
     const combined = [
       ...matchedClients.map(c => {
           const name = c.client_name.trim();
-          const prefix = "C: ";
           const idSuffix = counts[name] > 1 ? ` #${c.id}` : "";
-          const availableSpace = 20 - prefix.length - idSuffix.length;
-          const displayName = name.substring(0, availableSpace).trim();
-          return { id: `rep_c_${c.id}`, title: `${prefix}${displayName}${idSuffix}` };
+          return { id: `rep_c_${c.id}`, title: `C: ${name}${idSuffix}`.substring(0, 24) };
       }),
       ...matchedSuppliers.map(s => {
           const name = s.name.trim();
-          const prefix = "S: ";
           const idSuffix = counts[name] > 1 ? ` #${s.id}` : "";
-          const availableSpace = 20 - prefix.length - idSuffix.length;
-          const displayName = name.substring(0, availableSpace).trim();
-          return { id: `rep_s_${s.id}`, title: `${prefix}${displayName}${idSuffix}` };
+          return { id: `rep_s_${s.id}`, title: `S: ${name}${idSuffix}`.substring(0, 24) };
       })
-    ].slice(0, 3); // Max 3 buttons
+    ];
 
-    await whatsappService.sendInteractiveButtons(from, 
-      t('disambiguation_title', state.lang, { name: filters.entityName }),
-      combined
-    );
+    if (combined.length === 0) return;
+
+    // Use buttons if few matches, otherwise use a List Message
+    if (combined.length <= 3 && !isGlobal) {
+        await whatsappService.sendInteractiveButtons(from, 
+            t('disambiguation_title', lang, { name: filters?.entityName || 'Test' }),
+            combined.slice(0, 3)
+        );
+    } else {
+        const sections = [{
+            title: isGlobal ? (lang === 'fr' ? "Mes Contacts" : "My Contacts") : (lang === 'fr' ? "Résultats" : "Search Results"),
+            rows: combined.slice(0, 10).map(item => ({
+                id: item.id,
+                title: item.title,
+                description: item.id.startsWith('rep_c_') ? (lang === 'fr' ? "Client" : "Customer") : (lang === 'fr' ? "Fournisseur" : "Supplier")
+            }))
+        }];
+        const body = isGlobal ? (lang === 'fr' ? "Voici la liste de vos clients et fournisseurs enregistrés." : "Here is the list of your registered clients and suppliers.") : t('disambiguation_title', lang, { name: filters?.entityName || 'Search' });
+        await whatsappService.sendInteractiveList(from, body, (lang === 'fr' ? "Voir Tout" : "View All"), sections);
+    }
     
-    // Save filter context in state so we can pick it up when they click a button
-    stateService.setUserState(from, 'AWAITING_REPORT_DISAMBIGUATION', { filters });
+    if (filters) {
+        stateService.setUserState(from, 'AWAITING_REPORT_DISAMBIGUATION', { filters });
+    }
   }
 
   async handleYesNoQuery(from, filters, text) {
