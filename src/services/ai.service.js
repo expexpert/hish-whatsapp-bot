@@ -381,14 +381,14 @@ class AIService {
           { 
             role: "system", 
             content: "Classify the user's intent into exactly ONE of these tokens: " +
-                     "REPORT (FILTERED HISTORICAL DATA: summaries, months, years, totals, questions about money spent/earned, 'rapport', 'résumé', 'combien', 'combien j'ai payé'), " +
-                     "EXPENSE (RECORDING NEW OUTFLOW: 'I paid', 'spent', 'receipt', 'payé [montant]', 'achat', 'reçu'), " + 
+                     "REPORT (VIEWING/LISTING DATA: 'list', 'show', 'display', 'view', 'liste', 'afficher', 'montrer', 'voir', summaries, months, years, totals, questions about status like 'is this paid?', 'is it validated?', 'est-ce que... payé ?', 'combien', 'rapport', 'résumé'), " +
+                     "EXPENSE (RECORDING NEW OUTFLOW: 'I paid', 'spent', 'receipt', 'payé', 'achat', 'reçu'), " + 
                      "INVOICE (RECORDING NEW INFLOW: 'bill', 'invoice', 'facture', 'vente', 'client paid'), " + 
                      "STATEMENT (upload bank statements, 'relevé'), " + 
                      "ACCOUNTANT (question to accountant, 'comptable'), " + 
                      "MENU (start over, 'annuler', 'quitter'), " + 
                      "UNKNOWN (none of the above). " + 
-                     "CRITICAL LOGIC: If the user asks a question about totals (e.g., 'How much...', 'Combien...'), it is ALWAYS a REPORT. Mentions of months (March/Mars, Feb/Fév, etc.) ALWAYS mean REPORT. " +
+                     "CRITICAL LOGIC: If the user asks a status question (e.g., 'Is this paid?', 'Is VAT applied?'), it is ALWAYS a REPORT. If the user asks to 'list' or 'show' or 'view' something, it is ALWAYS a REPORT. If the user asks a question about totals (e.g., 'How much...', 'Combien...'), it is ALWAYS a REPORT. Mentions of months (March/Mars, Feb/Fév, etc.) ALWAYS mean REPORT. " +
                      "Detect lang: 'en' or 'fr'. " +
                      "Output JSON: { \"intent\": \"TOKEN\", \"lang\": \"en\"|\"fr\" }"
           },
@@ -403,7 +403,6 @@ class AIService {
       
       logger.debug(`🤖 AI INTENT SENSING: "${text}" -> ${intent} (${lang})`);
 
-      
       if (phone) {
         await laravelService.logAiUsage(phone, "gpt-4o-mini", response.usage.prompt_tokens, response.usage.completion_tokens, skipCooldown);
       }
@@ -474,6 +473,7 @@ class AIService {
             model: "gpt-4o-mini",
             messages: [
                 { 
+                    role: "system",
                     content: "Analyze the language of the user's message. " +
                              "If it's English, return 'en'. If it's French, return 'fr'. " +
                              "If it's a greeting like 'Bonjour', 'Salut', 'Coucou', return 'fr'. " +
@@ -549,39 +549,55 @@ class AIService {
      */
     async parseReportQuery(text, from) {
         try {
+            const now = new Date();
+            const today = now.toISOString().split('T')[0];
+            const dayName = now.toLocaleString('en-US', { weekday: 'long' });
+            const monthName = now.toLocaleString('en-US', { month: 'long' });
+            
             const prompt = `
-            You are a professional accounting assistant. Extract reporting filters from the user's message.
+            You are a professional accounting assistant. Extract reporting filters and determine the expected response format from the user's message.
             User Message: "${text}"
-            Current Date: ${new Date().toISOString().split('T')[0]}
+            Today is: ${dayName}, ${today} (Month: ${monthName})
 
-            RULES:
-            1. DATE EXTRACTION (PRIORITY): If they mention a month (e.g. "March", "last month"), extract the month number (1-12). If they mention a year (e.g. "2026"), extract it.
-            2. NEGATIVE CONSTRAINT: Month names (January-December) and Years (2025-2030) are NEVER entities. If you see "report for march", 'entityName' MUST be null.
-            3. ENTITY EXTRACTION: If they mention a company, store, or person (e.g. "Amazon", "Restaurant"), extract it as 'entityName'. 
-            4. DATATYPE: Determine if they are asking for 'expenses', 'invoices' (sales/income), or a 'general' summary.
+            FORMATS:
+            - BIT (1 or 0): For Yes/No questions.
+            - INTEGER: For "How many" questions.
+            - DECIMAL: For financial totals.
+            - ARRAY: For listings.
+            - ACTION: For commands.
 
-            EXAMPLES:
-            - "report for march" -> {"entityName": null, "month": 3, "year": null, "dataType": "general"}
-            - "report for nitesh arya march" -> {"entityName": "Nitesh Arya", "month": 3, "year": null, "dataType": "general"}
-            - "expenses for amazon" -> {"entityName": "Amazon", "month": null, "year": null, "dataType": "expenses"}
-            - "status of restaurant" -> {"entityName": "Restaurant", "month": null, "year": null, "dataType": "general"}
+            IDENTIFIERS:
+            - invoiceNumber, clientName, amount, date (YYYY-MM-DD)
+
+            DATE EXTRACTION RULES (Today is ${today}):
+            1. "this month" = 2026-05-01 to 2026-05-31.
+            2. "last month" = 2026-04-01 to 2026-04-30.
+            3. "this week" = The current Monday to Sunday. (Since today is Friday May 1, this week is 2026-04-27 to 2026-05-03).
+            4. "last week" = The previous Monday to Sunday. (Since today is Friday May 1, last week is 2026-04-20 to 2026-04-26).
+            5. "second last week" = The Monday to Sunday before that (2026-04-13 to 2026-04-19).
+            6. "yesterday" = ${new Date(new Date().setDate(new Date().getDate() - 1)).toISOString().split('T')[0]}.
+
+            STRICT RULE: A week ALWAYS starts on Monday and ends on Sunday. 
 
             RETURN JSON ONLY:
             {
                 "entityName": string | null,
                 "month": number (1-12) | null,
                 "year": number | null,
-                "dataType": "expenses" | "invoices" | "general"
+                "startDate": string (YYYY-MM-DD) | null,
+                "endDate": string (YYYY-MM-DD) | null,
+                "dataType": "expenses" | "invoices" | "general",
+                "responseType": "BIT" | "INTEGER" | "DECIMAL" | "ARRAY" | "ACTION",
+                "isYesNo": boolean,
+                "field": "vat" | "revenue" | "expenses" | "unpaid" | null,
+                "limit": number | null,
+                "identifiers": {
+                    "invoiceNumber": string | null,
+                    "clientName": string | null,
+                    "amount": number | null,
+                    "date": string | null
+                }
             }
-            Support English and French (e.g. "mars" -> month 3).
-            IMPORTANT: Short month names like "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" MUST be extracted as months.
-            If those words appear, do NOT include them in 'entityName'.
-            "from Jan" -> month: 1, entityName: null.
-            "summary for Raman Jan" -> entityName: "Raman", month: 1.
-            "January 2026" -> month: 1, year: 2026.
-            "this year" -> year: current year.
-            "last month" -> month: previous month.
-            "last year" -> year: previous year.
             `;
 
             const completion = await this.openai.chat.completions.create({

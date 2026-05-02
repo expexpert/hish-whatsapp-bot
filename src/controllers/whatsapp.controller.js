@@ -120,7 +120,7 @@ class WhatsAppController {
   async processMessage(message) {
     try {
       const from = message.from;
-      logger.debug(`📥 Incoming message from: "${from}"`);
+      let state = await stateService.getUserState(from);
 
 
       // 0. Global Activation Check
@@ -160,7 +160,7 @@ class WhatsAppController {
       }
 
       if (!isAuth) {
-          const state = await stateService.getUserState(from);
+          state = await stateService.getUserState(from);
           const now = Date.now();
           const cooldown = 15 * 60 * 1000; // 15 minutes
 
@@ -172,7 +172,7 @@ class WhatsAppController {
       }
 
       const type = message.type;
-      let state = await stateService.getUserState(from);
+      state = await stateService.getUserState(from);
 
       // --- LANGUAGE ONBOARDING CHECK ---
       // If language preference isn't confirmed for this session and isn't currently prompted
@@ -233,7 +233,7 @@ class WhatsAppController {
         if (!text) return;
 
         const textLower = text.toLowerCase();
-        const isInteractive = type === 'interactive';
+      const isInteractive = type === 'interactive';
         if (!interactiveId && isInteractive && message.interactive) {
           interactiveId = message.interactive.button_reply?.id || message.interactive.list_reply?.id;
         }
@@ -243,23 +243,25 @@ class WhatsAppController {
           const vatId = parseInt(interactiveId.replace('set_vat_', ''));
           const state = await stateService.getUserState(from);
           
-          if (state.data.invoiceData) {
+          const isInvoice = !!state.data.invoiceData;
+          const dataObj = isInvoice ? state.data.invoiceData : state.data.expenseData;
+          const path = isInvoice ? state.data.filePath : state.data.receiptPath;
+
+          if (dataObj) {
             // Fetch names to show in Review
             const resources = await laravelService.getTaxes(from);
             const selectedTax = resources?.tax?.find(t => parseInt(t.id) === vatId);
             
-            state.data.invoiceData.tva_id = vatId;
+            dataObj.tva_id = vatId;
             if (selectedTax) {
-                // Localize the name (VAT -> TVA) for FR users
                 const rawName = selectedTax.name || `${selectedTax.rate}%`;
-                state.data.invoiceData.tva_name = this.localizeTaxName(rawName, state.lang);
-                state.data.invoiceData.tva_percentage = selectedTax.rate;
+                dataObj.tax_rate = selectedTax.rate;
+                dataObj.tax_name = this.localizeTaxName(rawName, state.lang);
             }
+            
+            await stateService.setUserState(from, state.state, state.data);
+            return this.handleDocumentRouting(from, dataObj, path, 'interactive');
           }
-          await stateService.setUserState(from, state.state, state.data);
-          
-          // Resume flow
-          return this.handleDocumentRouting(from, {}, state.data.filePath, 'invoice');
         }
 
         // --- LANGUAGE SELECTION HANDLER ---
@@ -334,12 +336,19 @@ class WhatsAppController {
 
         // --- SMART LANGUAGE DETECTION ---
         // For conversational inputs not caught by the fast dictionary
-        if (!manualLanguageSwitched && isIdleOrLangPrompt && !interactiveId && text.length >= 4 && !message._skipLanguagePrompt) {
+        const lastPromptTime = state.data.lastLanguagePromptTime || 0;
+        const now = Date.now();
+        const cooldownMs = 2 * 60 * 1000; // 2 minutes cooldown
+        
+        if (!manualLanguageSwitched && isIdleOrLangPrompt && !interactiveId && text.length >= 4 && !message._skipLanguagePrompt && (now - lastPromptTime > cooldownMs)) {
             const detected = await aiService.detectLanguage(text, from, false, state.lang);
             
             // SECURITY GUARD: Only switch if its different from current lang 
             // and definitively NOT unknown.
             if (detected !== 'unknown' && detected !== state.lang) {
+                // Store prompt time to enable cooldown
+                state.data.lastLanguagePromptTime = now;
+                await stateService.setUserState(from, state.state, state.data);
                 return this.promptLanguageSwitch(from, detected, message); 
             }
         }
@@ -351,6 +360,19 @@ class WhatsAppController {
         const isCancel = interactiveId === 'cancel' || 
                         ['cancel', 'annuler', 'stop', 'quitter', 'menu'].includes(textLower);
         
+        // --- 🎯 HIGH PRIORITY STATE HANDLERS (Before Intent Detection) ---
+        if (state.state === 'AWAITING_IDENTIFIER') {
+            // Combine the identifier provided now with the original question
+            const combinedText = `${state.data.originalQuery} ${text}`;
+            logger.debug(`🧠 RESOLVING IDENTIFIER: "${text}" -> Combined: "${combinedText}"`);
+            
+            // Clear the state first to avoid loops
+            stateService.clearUserState(from);
+            
+            // Re-process with combined text (pass null for filters to trigger re-parsing)
+            return this.handleYesNoQuery(from, null, combinedText);
+        }
+
         // --- GLOBAL INTENT INTERCEPTOR (Allows switching at ANY time) ---
         const primaryIntents = {
             'status': { keywords: ['status', 'dashboard', 'balance', 'statut', 'solde', 'tableau', 'compte'], id: 'status' },
@@ -374,8 +396,11 @@ class WhatsAppController {
         if (interactiveId === 'quick_reports') {
             // Force priority for exact menu button interactions to avoid NLP regex conflicts
             detectedIntent = 'reports_menu';
-        } else if (textLower.startsWith('how much') || textLower.startsWith('combien') || textLower.startsWith('rapport') || 
-            textLower.includes('summary') || textLower.includes('résumé') || 
+        } else if (textLower.startsWith('how much') || textLower.startsWith('combien') || 
+            textLower.startsWith('is ') || textLower.startsWith('est-ce ') ||
+            textLower.startsWith('how many') || textLower.startsWith('combien de') ||
+            textLower.startsWith('list') || textLower.startsWith('show') || textLower.startsWith('liste') || textLower.startsWith('afficher') ||
+            textLower.startsWith('rapport') || textLower.includes('summary') || textLower.includes('résumé') || 
             ((textLower.includes('statement') || textLower.includes('relevé')) && (textLower.includes('for') || textLower.includes('pour') || textLower.includes('from') || textLower.includes('de')))) {
             detectedIntent = 'report';
         } else if (isCoreFrenchAction && state.state !== 'IDLE') {
@@ -385,13 +410,17 @@ class WhatsAppController {
             for (const [intent, config] of Object.entries(primaryIntents)) {
                 // STRICTER CHECK: Only trigger intent switches if:
                 // 1. Interactive ID matches exactly (Best)
-                // 2. Text matches exactly (Very Safe)
+                // 2. Text matches exactly (Only if IDLE or switching to a DIFFERENT major flow)
                 // 3. Text includes keyword BUT ONLY if state is IDLE (Safe)
                 const isExactMatch = textLower === intent || config.keywords.some(k => textLower === k);
                 const isButtonMatch = interactiveId === config.id;
                 const isIdleInclude = state.state === 'IDLE' && config.keywords.some(k => textLower.length > 5 && textLower.includes(k));
 
-                if (isButtonMatch || isExactMatch || isIdleInclude) {
+                // PROTECTION: If we are in a flow, don't let "Paid" or other keywords hijack the status selection
+                const isFlowActive = state.state && state.state !== 'IDLE';
+                const isStatusKeywords = ['paid', 'unpaid', 'payé', 'non payé'].includes(textLower);
+                
+                if (isButtonMatch || (isExactMatch && (!isFlowActive || !isStatusKeywords)) || isIdleInclude) {
                     detectedIntent = intent;
                     break;
                 }
@@ -400,7 +429,9 @@ class WhatsAppController {
 
         // --- NEW: AI INTENT & LANGUAGE SENSING ---
         // Triggered for natural language sentences to detect intent and language
-        if ((!detectedIntent || text.split(' ').length > 2) && !isCoreFrenchAction && (type === 'text' || type === 'audio') && state.state === 'IDLE') {
+        // SKIP if we are in a dedicated reporting search state to prevent misclassification
+        const isSearchState = state.state === 'AWAITING_REPORT_SEARCH' || state.state === 'AWAITING_REPORT_NAME';
+        if ((!detectedIntent || text.split(' ').length > 2) && !isCoreFrenchAction && !isSearchState && (type === 'text' || type === 'audio') && state.state === 'IDLE') {
             const greetings = ['hi', 'hello', 'hey', 'bonjour', 'salam', 'ola', 'ça va', 'ca va', 'salut', 'coucou'];
             if (!greetings.includes(textLower)) {
                 // Returns { intent, lang }
@@ -413,8 +444,14 @@ class WhatsAppController {
                 }
 
                 // If keywords didn't find anything, let AI set the intent
-                if (aiResult && !detectedIntent && aiResult.intent && aiResult.intent !== 'UNKNOWN' && aiResult.intent !== 'MENU') {
-                    detectedIntent = aiResult.intent.toLowerCase();
+                // CRITICAL: AI-detected REPORT always overrides keyword matches EXCEPT for 'status'
+                if (aiResult && aiResult.intent && aiResult.intent !== 'UNKNOWN' && aiResult.intent !== 'MENU') {
+                    const aiIntent = aiResult.intent.toLowerCase();
+                    const isStatusIntent = detectedIntent === 'status';
+                    
+                    if ((aiIntent === 'report' && !isStatusIntent) || !detectedIntent) {
+                        detectedIntent = aiIntent;
+                    }
                     logger.debug(`🤖 AI SENSING OVERRIDE: -> ${detectedIntent}`);
                 }
             }
@@ -435,6 +472,20 @@ class WhatsAppController {
             const type = interactiveId.startsWith('v_inv_') ? 'inv' : 'exp';
             const id = interactiveId.replace('v_inv_', '').replace('v_exp_', '');
             await this.handleDeliverSpecificMedia(from, type, id);
+            return;
+        }
+
+        // --- NEW: Handle Pagination (Next Page) ---
+        if (interactiveId && interactiveId.startsWith('next_page_')) {
+            const parts = interactiveId.split('_'); // next, page, type, month, year, pageNum, startDate, endDate
+            const type = parts[2];
+            const month = parseInt(parts[3]);
+            const year = parseInt(parts[4]);
+            const nextPage = parseInt(parts[5]);
+            const startDate = parts[6] === 'none' ? null : parts[6];
+            const endDate = parts[7] === 'none' ? null : parts[7];
+            
+            await this.handleListTransactions(from, type, null, month, year, startDate, endDate, nextPage);
             return;
         }
 
@@ -484,97 +535,6 @@ class WhatsAppController {
             return;
         }
 
-        if (detectedIntent) {
-            logger.debug(`🎯 DETECTED INTENT: ${detectedIntent} (Current State: ${state.state})`);
-
-            
-            // FIX: Prevent recursive prompting loops and allow direct data entry
-            // If already in the flow OR if the message follows a data-like pattern (longer than 2 words),
-            // skip the re-triggering of prompts and let the parser handle it.
-            const isReTrigger = (detectedIntent === 'expense' && state.state === 'AWAITING_EXPENSE_DATA') ||
-                                (detectedIntent === 'invoice' && state.state === 'AWAITING_INVOICE_DATA') ||
-                                (detectedIntent === 'statement' && state.state === 'AWAITING_STATEMENT_DATA');
-            
-            const isDirectData = (type === 'text' || type === 'audio') && text.split(' ').length > 2 && (detectedIntent === 'expense' || detectedIntent === 'invoice');
-
-            if ((isReTrigger || isDirectData) && (type === 'text' || type === 'audio' || type === 'voice')) {
-                logger.debug(`♻️ RE-TRIGGER OR DIRECT DATA: Skipping intent reset to allow parsing logic to take over.`);
-
-                // We fall through to the parsing logic below
-            } else {
-                // If switching to a new major task or triggering via button, clear the old state first
-                stateService.clearUserState(from);
-
-                switch (detectedIntent) {
-                    case 'menu':
-                        await this.sendWelcomeMenu(from);
-                        return;
-                    case 'status':
-                        if (type === 'text' || type === 'audio') {
-                            return this.handleReportQuery(from, text);
-                        }
-                        await whatsappService.sendTextMessage(from, t('fetching_status', state.lang));
-                        const stats = await laravelService.getAccountStatus(from, null, null, null, state.lang);
-                        await this.sendStatusInteractive(from, stats);
-                        return;
-                    case 'expense':
-                        stateService.setUserState(from, 'AWAITING_EXPENSE_DATA');
-                        await whatsappService.sendTextMessage(from, t('prompt_expense_general', state.lang));
-                        return;
-                    case 'invoice':
-                        stateService.setUserState(from, 'AWAITING_INVOICE_DATA');
-                        await whatsappService.sendTextMessage(from, t('prompt_invoice_general', state.lang));
-                        return;
-                    case 'statement':
-                        stateService.setUserState(from, 'AWAITING_STATEMENT_DATA');
-                        await whatsappService.sendTextMessage(from, t('prompt_stmt_general', state.lang));
-                        return;
-                    case 'accountant':
-                        await this.handleAccountantQuery(from);
-                        return;
-                    case 'reports_menu':
-                        await this.sendReportMenu(from);
-                        return;
-                    case 'report':
-                        await this.handleReportQuery(from, text);
-                        return;
-                }
-            }
-        } else if (state.state === 'IDLE' || text.split(' ').length > 2) {
-            // --- AI INTENT FALLBACK ---
-            const aiResult = await aiService.classifyIntent(text, from, true);
-            const aiIntent = aiResult?.intent;
-
-            if (aiIntent !== 'UNKNOWN' && aiIntent !== 'MENU') {
-                // Check and update language if AI detected a switch
-                if (aiResult && aiResult.lang && aiResult.lang !== state.lang) {
-                    stateService.setLanguage(from, aiResult.lang);
-                    state.lang = aiResult.lang;
-                }
-
-                const isMatchingFlow = (aiIntent === 'EXPENSE' && state.state.includes('EXPENSE')) ||
-                                       (aiIntent === 'INVOICE' && state.state.includes('INVOICE')) ||
-                                       (aiIntent === 'STATEMENT' && state.state.includes('STATEMENT'));
-                
-                if (!isMatchingFlow) {
-                  stateService.clearUserState(from);
-                }
-                
-                if (aiIntent === 'STATUS') {
-                    return this.handleReportQuery(from, text);
-                } else if (aiIntent === 'EXPENSE' || aiIntent === 'INVOICE') {
-                    // These will be handled by the direct data entry parser below
-                    // Just let them continue, but ensure we don't fall through to menu
-                } else if (aiIntent === 'ACCOUNTANT') {
-                    await this.handleAccountantQuery(from);
-                    return;
-                } else if (aiIntent === 'REPORT') {
-                    await this.handleReportQuery(from, text);
-                    return;
-                }
-            }
-        }
-
         // Check for 'Back to Main Menu' / Greetings
         const greetings = ['hi', 'hello', 'hey', 'menu', 'main menu', 'back to main menu'];
         if (greetings.includes(textLower)) {
@@ -583,47 +543,68 @@ class WhatsAppController {
           return;
         }
 
+        // --- 🎯 STATE-SPECIFIC HANDLERS (Prioritized over Task Switching) ---
+        // This ensures that if we are in a flow, we handle the flow-specific inputs
+        // before we check for global task-switching keywords like "status".
+
         // Check for Confirmation/Edit state
         if (state.state === 'AWAITING_EXPENSE_CONFIRMATION') {
           if (isConfirm) {
-            const result = await laravelService.createExpense(state.data.expenseData, state.data.receiptPath, from);
+            const exp = state.data.expenseData;
+            const total_ttc = parseFloat(exp.amount || 0);
+            const tva_rate = parseFloat(exp.tva_percentage || 0);
+            
+            // Calculate actual VAT amount in MAD (Back-calculated from TTC)
+            const total_ht = total_ttc / (1 + (tva_rate / 100));
+            exp.vat = total_ttc - total_ht; // Storing the MAD amount in .vat field for the API
+
+            const result = await laravelService.createExpense(exp, state.data.receiptPath, from);
+            
+            if (result.success === false) {
+                await whatsappService.sendTextMessage(from, `⚠️ *${t('error_occurred', state.lang)}*\n\n${result.message || 'Unknown error'}`);
+                return;
+            }
+
             let feedback = t('record_saved_success', state.lang);
+            const path = require('path');
             
             if (state.data.receiptPath) {
-              const fileName = path.basename(state.data.receiptPath);
-              const isAudio = fileName.endsWith('.ogg');
-              
-              if (!isAudio) {
-                feedback += "\n" + t('sync_success_msg', state.lang);
+                const fileName = path.basename(state.data.receiptPath);
+                const isAudio = fileName.endsWith('.ogg');
                 
-                // Use signed URL if available, else fallback safely
-                if (result.data && (result.data.download_url || result.data.id)) {
-                  const downloadUrl = result.data.download_url || `${laravelService.publicUrl}/api/bot/file/${result.data.id}`;
-                  logger.debug('🔗 GENERATED DOWNLOAD URL', { downloadUrl });
-                  logger.debug(`💸 [INFO] Delivering Expense Receipt: ${downloadUrl}`);
-                  
-                  if (downloadUrl.includes('localhost') || downloadUrl.includes('127.0.0.1')) {
-                  }
-
-                  feedback += `\n\n---\n📥 *${t('open_receipt', state.lang).toUpperCase()}*\n${downloadUrl}`;
-                  
-                  // Also send as a proper Document Attachment for better UX
-                  const extension = result.data.document_path ? path.extname(result.data.document_path) : '.pdf';
-                  const filename = `Receipt_${result.data.id || 'Draft'}${extension}`;
-                  await whatsappService.sendDocument(from, downloadUrl, filename);
+                if (!isAudio) {
+                    feedback += "\n" + t('sync_success_msg', state.lang);
+                    if (result.data && (result.data.download_url || result.data.id)) {
+                        const downloadUrl = result.data.download_url || `${laravelService.publicUrl}/api/bot/file/${result.data.id}`;
+                        feedback += `\n\n---\n📥 *${t('open_receipt', state.lang).toUpperCase()}*\n${downloadUrl}`;
+                    }
                 } else {
-                  let finalUrl = result.file_url || `${config.botPublicUrl}/storage/${fileName}`;
-                  feedback += `\n\n---\n📸 *${t('image_attached', state.lang).toUpperCase()}*\n${finalUrl}`;
+                    feedback += "\n" + t('voice_processed_msg', state.lang);
                 }
-              } else {
-                feedback += "\n" + t('voice_processed_msg', state.lang);
-              }
             } else {
-              feedback += "\n" + t('accountant_notified_msg', state.lang);
+                feedback += "\n" + t('accountant_notified_msg', state.lang);
             }
             
+            // 1. Send Success Text FIRST
             await whatsappService.sendTextMessage(from, feedback);
+            
+            // 2. Add short buffer before PDF/Document
+            await new Promise(resolve => setTimeout(resolve, 500));
+
+            // 3. Send PDF/Document (if applicable)
+            if (state.data.receiptPath && !state.data.receiptPath.endsWith('.ogg')) {
+                if (result.data && (result.data.download_url || result.data.id)) {
+                    const downloadUrl = result.data.download_url || `${laravelService.publicUrl}/api/bot/file/${result.data.id}`;
+                    const extension = result.data.document_path ? path.extname(result.data.document_path) : '.pdf';
+                    const filename = `Receipt_${result.data.id || 'Draft'}${extension}`;
+                    await whatsappService.sendDocument(from, downloadUrl, filename);
+                }
+            }
+
+            // 4. Final State Cleanup & Menu
             stateService.clearUserState(from);
+            await new Promise(resolve => setTimeout(resolve, 3500)); 
+            await this.sendWelcomeMenu(from);
           } else if (isEdit) {
             stateService.setUserState(from, 'AWAITING_EDIT_SELECT', state.data);
             await this.sendEditSelectionButtons(from);
@@ -636,6 +617,7 @@ class WhatsAppController {
           }
           return;
         }
+
         
         if (state.state === 'AWAITING_REPORT_SEARCH' && (isInteractive || !detectedIntent)) {
             return this.handleReportQuery(from, text);
@@ -707,6 +689,11 @@ class WhatsAppController {
                 
                 const result = await laravelService.createInvoice(state.data.invoiceData, state.data.filePath, from);
                 logger.debug('🧾 LARAVEL RESPONSE RECEIVED', result);
+
+                if (result.success === false) {
+                    await whatsappService.sendTextMessage(from, `⚠️ *${t('error_occurred', state.lang)}*\n\n${result.message || 'Unknown error'}`);
+                    return;
+                }
                 
                 // Laravel returns the signed URL in 'download_url'
                 if (result.data) {
@@ -769,7 +756,11 @@ class WhatsAppController {
                                             `✅ *Status:* ${t('recorded_successfully', state.lang)}`;
 
                         // Force the delivery of the text receipt immediately to bypass any Ngrok/Media Meta drops
-                        await whatsappService.sendTextMessage(from, successText);
+                        if (successText) {
+                            await whatsappService.sendTextMessage(from, successText);
+                            // Add buffer before PDF
+                            await new Promise(resolve => setTimeout(resolve, 500));
+                        }
 
                         const isPdfRoute = downloadUrl.includes('/pdf');
                         const isImage = result.data.document_path && (
@@ -796,10 +787,15 @@ class WhatsAppController {
                     await whatsappService.sendTextMessage(from, `✅ *${t('recorded_successfully', state.lang)}*`);
                 }
                 
-                // 2. Clear state and show menu
-                // We use a longer delay (2.5s) to ensure the PDF arrives before the menu
+                // Final State Cleanup
                 stateService.clearUserState(from);
-                await new Promise(resolve => setTimeout(resolve, 2500)); 
+
+                // We use staggered delays to ensure correct visual sequence on WhatsApp:
+                // 1. Success Text (Already sent)
+                // 2. Short buffer (500ms) before PDF
+                // 3. Send PDF (Already attempted)
+                // 4. Longer buffer (3.5s) before the final Welcome Menu
+                await new Promise(resolve => setTimeout(resolve, 3500)); 
                 await this.sendWelcomeMenu(from);
             } else if (isEdit) {
                 stateService.setUserState(from, 'AWAITING_EDIT_SELECT_INVOICE', state.data);
@@ -862,6 +858,15 @@ class WhatsAppController {
           } else if (interactiveId === 'desc' || textLower === 'description' || textLower === 'notes') {
             stateService.setUserState(from, 'AWAITING_DESCRIPTION_EDIT' + nextStateSuffix, state.data);
             await whatsappService.sendTextMessage(from, t('prompt_edit_notes', state.lang));
+          } else if (interactiveId === 'btn_edit_status' || interactiveId === 'status' || textLower === 'status') {
+            // Priority: Check if we are in an edit state to prevent global intent switching
+            if (isInvoice) {
+                stateService.setUserState(from, 'AWAITING_INVOICE_STATUS', state.data);
+                await this.sendInvoiceStatusButtons(from);
+            } else {
+                stateService.setUserState(from, 'AWAITING_EXPENSE_STATUS', state.data);
+                await this.sendExpenseStatusButtons(from);
+            }
           } else if (interactiveId === 'all' || textLower === 're-submit entry') {
             stateService.setUserState(from, 'IDLE');
             await whatsappService.sendTextMessage(from, t('prompt_edit_details', state.lang));
@@ -918,6 +923,11 @@ class WhatsAppController {
                 await whatsappService.sendTextMessage(from, t('uploading_stmt', state.lang).replace('${monthYear}', state.data.monthYear));
                 const result = await laravelService.uploadStatement(state.data.filePath, from, state.data.monthYear);
                 
+                if (result.success === false) {
+                    await whatsappService.sendTextMessage(from, `⚠️ *${t('error_occurred', state.lang)}*\n\n${result.message || 'Unknown error'}`);
+                    return;
+                }
+
                 if (result.data && (result.data.download_url || result.data.id)) {
                     const downloadUrl = result.data.download_url || `${laravelService.publicUrl}/api/bot/file/${result.data.id}`;
                     
@@ -1048,7 +1058,12 @@ class WhatsAppController {
                 await whatsappService.sendTextMessage(from, t('prompt_edit_category', state.lang));
                 return;
             }
-            state.data.expenseData.category = interactiveId || text;
+            if (interactiveId && String(interactiveId).startsWith('cat_')) {
+                state.data.expenseData.category_id = parseInt(String(interactiveId).replace('cat_', ''));
+                state.data.expenseData.category = text; // The title of the list item
+            } else {
+                state.data.expenseData.category = interactiveId || text;
+            }
             return this.handleDocumentRouting(from, state.data.expenseData, state.data.receiptPath, 'interactive');
         }
 
@@ -1058,8 +1073,42 @@ class WhatsAppController {
             return this.handleDocumentRouting(from, state.data.expenseData, state.data.receiptPath, 'text');
         }
 
+        // --- Handle Expense Status Selection ---
+        if (state.state === 'AWAITING_EXPENSE_STATUS' && !detectedIntent) {
+            state.data.expenseData.status = interactiveId ? interactiveId.toUpperCase() : text.toUpperCase();
+            await stateService.setUserState(from, state.state, state.data);
+            return this.handleDocumentRouting(from, state.data.expenseData, state.data.receiptPath, 'interactive');
+        }
+
+        // --- Handle VAT Selection (Invoice/Expense) ---
+        if ((state.state === 'AWAITING_INVOICE_VAT' || state.state === 'AWAITING_EXPENSE_VAT') && !detectedIntent) {
+            const isInvoice = state.state.includes('INVOICE');
+            const dataObj = isInvoice ? state.data.invoiceData : state.data.expenseData;
+            const path = isInvoice ? state.data.filePath : state.data.receiptPath;
+
+            const tvaId = (interactiveId && String(interactiveId).startsWith('vat_')) ? String(interactiveId).replace('vat_', '') : null;
+            if (tvaId) {
+                dataObj.tva_id = parseInt(tvaId);
+            } else {
+                // Smart Text fallback: Ignore timestamps from copy-pasted messages
+                let rate = NaN;
+                const rateMatch = text.match(/Rate:\s*([0-9.]+)/i) || text.match(/(?:^|\s)([0-9]+(?:\.[0-9]+)?)(?:%|\s|$)/);
+                if (rateMatch) {
+                    rate = parseFloat(rateMatch[1]);
+                } else {
+                    rate = parseFloat(text.replace(/[^0-9.]/g, ''));
+                }
+
+                if (!isNaN(rate)) {
+                    dataObj.vat = rate; // Let the routing resolve it to an ID
+                }
+            }
+            await stateService.setUserState(from, state.state, state.data);
+            return this.handleDocumentRouting(from, dataObj, path, 'interactive');
+        }
+
         // --- Handle Expense Supplier Selection ---
-        if (state.state === 'AWAITING_EXPENSE_ENTITY' && !detectedIntent) {
+        if (state.state === 'AWAITING_EXPENSE_SUPPLIER' && !detectedIntent) {
             if (interactiveId === 'skip_supplier') {
                 stateService.setUserState(from, 'AWAITING_ENTITY_EDIT', state.data);
                 await whatsappService.sendTextMessage(from, t('prompt_supplier_name', state.lang));
@@ -1075,7 +1124,8 @@ class WhatsAppController {
                 }
             }
 
-            state.data.expenseData.entity = interactiveId || text;
+            state.data.expenseData.supplier_id = (interactiveId && !isNaN(interactiveId)) ? parseInt(interactiveId) : null;
+            state.data.expenseData.entity = text.includes('|') ? text.split('|')[1].trim() : text;
             return this.handleDocumentRouting(from, state.data.expenseData, state.data.receiptPath, 'interactive');
         }
 
@@ -1098,33 +1148,126 @@ class WhatsAppController {
         const initialStates = ['IDLE', 'AWAITING_EXPENSE_DATA', 'AWAITING_INVOICE_DATA', 'AWAITING_STATEMENT_DATA'];
         const isCapturing = state.state && state.state !== 'IDLE';
 
-        const isCommand = (initialStates.includes(state.state) || (!state.state || state.state === 'IDLE')) && 
-                          (textLower.startsWith('expense') || 
-                           textLower.startsWith('invoice') || 
-                           textLower.startsWith('statement') || 
-                           text.split(' ').length > 2 ||
-                           isCapturing); // If already in a flow, treat any input as a command for the parser
 
-        if ((type === 'text' || type === 'audio' || type === 'voice') && isCommand) {
-            try {
-                const categories = await laravelService.getCategories(from);
-                // Pass true to skipCooldown because we already checked quota in the intent sensing above
-                const data = await aiService.parseExpenseText(text, categories, from, true, state.lang);
-                // Ensure audioPath is passed so voice notes are linked as proof
-                await this.handleDocumentRouting(from, data, audioPath || null, type);
-            } catch (error) {
-                if (error.message.includes("quota") || error.message.includes("limit")) {
-                    await whatsappService.sendTextMessage(from, `🛑 *AI Limit Reached*\n\n${error.message}`);
-                } else {
-                    throw error;
-                }
+      if (detectedIntent) {
+        logger.debug(`🎯 DETECTED INTENT: ${detectedIntent} (Current State: ${state.state})`);
+        
+        // FIX: Prevent recursive prompting loops and allow direct data entry
+        const isReTrigger = (detectedIntent === 'expense' && state.state === 'AWAITING_EXPENSE_DATA') ||
+                            (detectedIntent === 'invoice' && state.state === 'AWAITING_INVOICE_DATA') ||
+                            (detectedIntent === 'statement' && state.state === 'AWAITING_STATEMENT_DATA');
+        
+        const isDirectData = (type === 'text' || type === 'audio') && text.split(' ').length > 2 && (detectedIntent === 'expense' || detectedIntent === 'invoice');
+
+        if ((isReTrigger || isDirectData) && (type === 'text' || type === 'audio' || type === 'voice')) {
+            logger.debug(`♻️ RE-TRIGGER OR DIRECT DATA: Skipping intent reset to allow parsing logic to take over.`);
+        } else {
+            // If switching to a new major task or triggering via button, clear the old state first
+            stateService.clearUserState(from);
+
+            switch (detectedIntent) {
+                case 'menu':
+                    await this.sendWelcomeMenu(from);
+                    return;
+                case 'status':
+                    if (type === 'text' || type === 'audio') {
+                        return this.handleReportQuery(from, text);
+                    }
+                    await whatsappService.sendTextMessage(from, t('fetching_status', state.lang));
+                    const stats = await laravelService.getAccountStatus(from, null, null, null, state.lang);
+                    await this.sendStatusInteractive(from, stats);
+                    return;
+                case 'expense':
+                    stateService.setUserState(from, 'AWAITING_EXPENSE_DATA');
+                    await whatsappService.sendTextMessage(from, t('prompt_expense_general', state.lang));
+                    return;
+                case 'invoice':
+                    stateService.setUserState(from, 'AWAITING_INVOICE_DATA');
+                    await whatsappService.sendTextMessage(from, t('prompt_invoice_general', state.lang));
+                    return;
+                case 'statement':
+                    stateService.setUserState(from, 'AWAITING_STATEMENT_DATA');
+                    await whatsappService.sendTextMessage(from, t('prompt_stmt_general', state.lang));
+                    return;
+                case 'accountant':
+                    await this.handleAccountantQuery(from);
+                    return;
+                case 'reports_menu':
+                    await this.sendReportMenu(from);
+                    return;
+                case 'report':
+                    await this.handleReportQuery(from, text);
+                    return;
             }
-            return;
+        }
+    } else if (state.state === 'IDLE' || text.split(' ').length > 2) {
+        // --- AI INTENT FALLBACK ---
+        const aiResult = await aiService.classifyIntent(text, from, true);
+        const aiIntent = aiResult?.intent;
+
+        if (aiIntent !== 'UNKNOWN' && aiIntent !== 'MENU') {
+            // Check and update language if AI detected a switch
+            if (aiResult && aiResult.lang && aiResult.lang !== state.lang) {
+                stateService.setLanguage(from, aiResult.lang);
+                state.lang = aiResult.lang;
+            }
+
+            const isMatchingFlow = (aiIntent === 'EXPENSE' && state.state.includes('EXPENSE')) ||
+                                   (aiIntent === 'INVOICE' && state.state.includes('INVOICE')) ||
+                                   (aiIntent === 'STATEMENT' && state.state.includes('STATEMENT'));
+            
+            if (!isMatchingFlow) {
+              stateService.clearUserState(from);
+            }
+            
+            if (aiIntent === 'STATUS') {
+                return this.handleReportQuery(from, text);
+            } else if (aiIntent === 'EXPENSE' || aiIntent === 'INVOICE') {
+                // These will be handled by the direct data entry parser below
+            } else if (aiIntent === 'ACCOUNTANT') {
+                await this.handleAccountantQuery(from);
+                return;
+            } else if (aiIntent === 'REPORT') {
+                await this.handleReportQuery(from, text);
+                return;
+            }
+        }
+    }
+
+    // --- Unified Parsing Fallback ---
+    const isCommand = (initialStates.includes(state.state) || (!state.state || state.state === 'IDLE')) && 
+                      (textLower.startsWith('expense') || 
+                       textLower.startsWith('invoice') || 
+                       textLower.startsWith('statement') || 
+                       text.split(' ').length > 2 ||
+                       isCapturing);
+
+    if ((type === 'text' || type === 'audio' || type === 'voice') && isCommand) {
+        try {
+            const categories = await laravelService.getCategories(from);
+            const data = await aiService.parseExpenseText(text, categories, from, true, state.lang);
+            await this.handleDocumentRouting(from, data, audioPath || null, type);
+        } catch (error) {
+            if (error.message.includes("quota") || error.message.includes("limit")) {
+                await whatsappService.sendTextMessage(from, `🛑 *AI Limit Reached*\n\n${error.message}`);
+            } else {
+                throw error;
+            }
+        }
+        return;
+    }
+
+      // Fallback: If nothing matched, handle based on current state
+      if (type !== 'status' && !interactiveId) {
+        if (state.state && state.state !== 'IDLE') {
+            const flowName = state.state.includes('INVOICE') ? t('label_client', state.lang).toLowerCase() : (state.state.includes('STATEMENT') ? t('btn_upload_stmt', state.lang).toLowerCase() : t('btn_record_expense', state.lang).toLowerCase());
+            await whatsappService.sendTextMessage(from, t('unrecognized_flow', state.lang, { flow: flowName }));
+        } else {
+            await this.sendWelcomeMenu(from);
         }
       }
 
-      // 2. Media Handler (Image, Document)
-      if (type === 'image' || type === 'document') {
+    } else if (type === 'image' || type === 'document') {
             const state = await stateService.getUserState(from);
             const isCapturing = state.state !== 'IDLE';
 
@@ -1201,17 +1344,7 @@ class WhatsAppController {
 
             await this.handleDocumentRouting(from, data, localPath, type);
             return;
-      }
-
-      // Fallback: If nothing matched, handle based on current state
-      if (type !== 'status' && !interactiveId) {
-        if (state.state && state.state !== 'IDLE') {
-            const flowName = state.state.includes('INVOICE') ? t('label_client', state.lang).toLowerCase() : (state.state.includes('STATEMENT') ? t('btn_upload_stmt', state.lang).toLowerCase() : t('btn_record_expense', state.lang).toLowerCase());
-            await whatsappService.sendTextMessage(from, t('unrecognized_flow', state.lang, { flow: flowName }));
-        } else {
-            await this.sendWelcomeMenu(from);
-        }
-      }
+    }
     } catch (error) {
       console.error('❌ ERROR IN PROCESS MESSAGE:', error);
     }
@@ -1239,7 +1372,7 @@ class WhatsAppController {
             'notes', 'description', 'documentType',
             'client_id', 'client_name', 'entity', 
             'supplier_id', 'supplier_name', 'category', 'category_id',
-            'tva_id', 'tva_percentage', 'tva_name', 'vat', 'product_id'
+            'tva_id', 'tax_rate', 'tax_name', 'vat', 'product_id'
         ];
         fields.forEach(f => {
             const newVal = mergedData[f];
@@ -1251,25 +1384,7 @@ class WhatsAppController {
             }
         });
         
-        // --- 1.1 DEPENDENCY INVALIDATION (Avoid Sticky IDs) ---
-        // If the NEW extraction (data) contains a master field, force clear its ID counterpart
-        // so the Proactive Resolver can do its job on the new value.
-        const isNewVat = data.vat !== undefined && data.vat !== null && !invalidVals.includes(String(data.vat).toLowerCase());
-        const isNewClient = (data.client_name || data.entity) && !invalidVals.includes(String(data.client_name || data.entity).toLowerCase());
-        const isNewSupplier = (data.supplier_name || data.entity) && !invalidVals.includes(String(data.supplier_name || data.entity).toLowerCase());
-        const isNewAmount = data.amount !== undefined && data.amount !== null && parseFloat(data.amount) > 0;
-
-        if (isNewVat || isNewAmount) {
-            delete mergedData.tva_id;
-            delete mergedData.tva_percentage;
-            delete mergedData.tva_name;
-        }
-        if (isNewClient) {
-            delete mergedData.client_id;
-        }
-        if (isNewSupplier) {
-            delete mergedData.supplier_id;
-        }
+        // Dependency invalidation removed to prevent persistent session data from overwriting manual overrides.
 
         // Forced Type Preservation
         if (!mergedData.documentType) {
@@ -1302,18 +1417,25 @@ class WhatsAppController {
     // --- 3. NORMALIZATION & FUZZY LOOKUP ---
     const sanitize = (val) => val ? String(val).toLowerCase().replace(/[.!]$/, '').trim() : '';
     
+    // Default Status if missing
+    if (!mergedData.status || invalidVals.includes(String(mergedData.status).toLowerCase())) {
+        mergedData.status = (mergedData.documentType === 'INVOICE') ? 'UNPAID' : 'PAID';
+    }
+    
     // A. Proactive Tax Resolution (Resolve text rates to DB IDs immediately)
     if (!mergedData.tva_id && (mergedData.vat !== null && mergedData.vat !== undefined)) {
         const taxMatch = await this.resolveTaxFromRate(from, mergedData.vat, mergedData.amount);
         if (taxMatch) {
             mergedData.tva_id = taxMatch.id;
-            mergedData.tva_percentage = taxMatch.rate;
-            mergedData.tva_name = this.localizeTaxName(taxMatch.name, state.lang);
+            mergedData.tax_rate = taxMatch.rate;
+            mergedData.tax_name = this.localizeTaxName(taxMatch.name, state.lang);
             logger.debug(`🎯 SMART TAX AUTO-SELECTED (Math Aware): ${taxMatch.rate}% (ID: ${taxMatch.id})`);
         }
     }
 
     if (mergedData.documentType === 'INVOICE' || type === 'invoice') {
+        // Sync entity and client_name
+        if (mergedData.client_name && !mergedData.entity) mergedData.entity = mergedData.client_name;
         if (mergedData.entity && !mergedData.client_name) mergedData.client_name = mergedData.entity;
         
         // A. Client Resolution
@@ -1324,6 +1446,7 @@ class WhatsAppController {
             if (match) {
                 mergedData.client_id = match.id;
                 mergedData.client_name = match.company_name || match.client_name;
+                mergedData.entity = mergedData.client_name; // Sync back to entity
             }
         }
 
@@ -1338,6 +1461,10 @@ class WhatsAppController {
             }
         }
     } else if (mergedData.documentType === 'EXPENSE') {
+        // Sync entity and supplier_name
+        if (mergedData.supplier_name && !mergedData.entity) mergedData.entity = mergedData.supplier_name;
+        if (mergedData.entity && !mergedData.supplier_name) mergedData.supplier_name = mergedData.entity;
+
         if (mergedData.entity && !mergedData.supplier_id) {
             const suppliers = await fetchSuppliers();
             const searchName = sanitize(mergedData.entity);
@@ -1345,6 +1472,7 @@ class WhatsAppController {
             if (match) {
                 mergedData.supplier_id = match.id;
                 mergedData.entity = match.name;
+                mergedData.supplier_name = match.name; // Sync back
             }
         }
         
@@ -1357,10 +1485,22 @@ class WhatsAppController {
                 logger.debug(`🎯 SMART CATEGORY AUTO-SELECTED: ${catMatch.name} (ID: ${catMatch.id})`);
             } else {
                 // Not found - clear so it triggers interactive selection
-                logger.debug(`⚠️ CATEGORY NOT FOUND IN DB: ${mergedData.category}. Clearing for selection.`);
+                logger.debug(`⚠️ CATEGORY NOT FOUND IN DB: ${mergedData.category}. Clearing.`);
                 delete mergedData.category;
             }
         }
+    }
+
+    // Payment Method Resolution
+    if (mergedData.payment_method && (invalidVals.includes(String(mergedData.payment_method).toLowerCase()) || String(mergedData.payment_method).toLowerCase() === 'whatsapp')) {
+        // Clear if invalid
+        delete mergedData.payment_method;
+    } else if (mergedData.payment_method) {
+        // Fuzzy Match against official list
+        const enMethods = ["Cash", "Bank Transfer", "Credit/Debit Card", "Cheque", "Mobile Payment", "Online Payment", "Direct Debit", "Instant Bank Transfer", "PayPal", "Other"];
+        const searchVal = mergedData.payment_method.toLowerCase();
+        const match = enMethods.find(m => m.toLowerCase() === searchVal || searchVal.includes(m.toLowerCase()) || m.toLowerCase().includes(searchVal));
+        if (match) mergedData.payment_method = match;
     }
 
     // Status Resolution
@@ -1370,7 +1510,13 @@ class WhatsAppController {
         else if (s.includes('unpaid')) mergedData.status = 'Unpaid';
     }
 
-    // --- 🛣️ ROUTING HIERARCHY ---
+    logger.debug(`🛤️ [ROUTING] State: ${state.state}, Document: ${mergedData.documentType || 'EXPENSE'}, Data:`, { 
+        amount: mergedData.amount,
+        supplier_id: mergedData.supplier_id,
+        category: mergedData.category,
+        tva_id: mergedData.tva_id,
+        payment: mergedData.payment_method
+    });
 
     if (type === 'status') {
         const d = new Date();
@@ -1391,6 +1537,7 @@ class WhatsAppController {
         }
     } else if (mergedData.documentType === 'INVOICE' || type === 'invoice') {
         const inv = mergedData;
+        if (!inv.date) inv.date = today;
 
         const isAudio = filePath && filePath.endsWith('.ogg');
         if (!inv.amount || parseFloat(inv.amount) <= 0) {
@@ -1434,6 +1581,10 @@ class WhatsAppController {
         if (!exp.amount || parseFloat(exp.amount) <= 0) {
             stateService.setUserState(from, 'AWAITING_EXPENSE_AMOUNT', { expenseData: exp, receiptPath: filePath });
             await whatsappService.sendTextMessage(from, t('error_invalid_amount', state.lang));
+        } else if (!exp.supplier_id && (!exp.entity || invalidVals.includes(String(exp.entity).toLowerCase()))) {
+            const suppliers = await fetchSuppliers();
+            stateService.setUserState(from, 'AWAITING_EXPENSE_SUPPLIER', { expenseData: exp, receiptPath: filePath });
+            await this.sendSupplierSelectionList(from, suppliers);
         } else if (!exp.category || invalidVals.includes(String(exp.category).toLowerCase())) {
             const categories = await laravelService.getCategories(from);
             stateService.setUserState(from, 'AWAITING_EXPENSE_CATEGORY', { expenseData: exp, receiptPath: filePath });
@@ -1441,6 +1592,23 @@ class WhatsAppController {
         } else if (!exp.payment_method || invalidVals.includes(String(exp.payment_method).toLowerCase()) || String(exp.payment_method).toLowerCase() === 'whatsapp') {
             stateService.setUserState(from, 'AWAITING_EXPENSE_PAYMENT_METHOD', { expenseData: exp, receiptPath: filePath });
             await this.sendPaymentMethodSelectionList(from, 'EXPENSE');
+        } else if (!exp.status || invalidVals.includes(String(exp.status).toLowerCase())) {
+            stateService.setUserState(from, 'AWAITING_EXPENSE_STATUS', { expenseData: exp, receiptPath: filePath });
+            await this.sendExpenseStatusButtons(from);
+        } else if (!exp.tva_id) {
+            // Attempt auto-resolution if we have a rate but no ID
+            if (exp.vat) {
+                const resources = await laravelService.getTaxes(from);
+                const match = resources?.tax?.find(t => parseFloat(t.rate) === parseFloat(exp.vat));
+                if (match) {
+                    exp.tva_id = match.id;
+                    exp.tax_rate = match.rate;
+                    exp.tax_name = match.name;
+                    return this.handleDocumentRouting(from, exp, filePath, type);
+                }
+            }
+            stateService.setUserState(from, 'AWAITING_EXPENSE_VAT', { expenseData: exp, receiptPath: filePath });
+            await this.sendVatSelectionList(from);
         } else {
             stateService.setUserState(from, 'AWAITING_EXPENSE_CONFIRMATION', { expenseData: exp, receiptPath: filePath });
             await this.sendExpenseReviewButtons(from, exp, filePath);
@@ -1768,12 +1936,26 @@ class WhatsAppController {
     const payKey = `pay_${rawPayment.replace(/[\s\/]/g, '_')}`;
     const localizedPayment = t(payKey, state.lang);
 
-    let body = `*${t('review_expense', state.lang)}*\n` +
-      `*${t('field_amount', state.lang)}:* ${expenseData.amount} ${expenseData.currency || 'MAD'}\n` +
+    // --- Official Tax Calculation (TTC is treated as Total) ---
+    const total_ttc = parseFloat(expenseData.amount || 0);
+    const tva_rate = parseFloat(expenseData.tax_rate || expenseData.tva_percentage || 0);
+    
+    // Back-calculate HT from TTC: HT = TTC / (1 + rate/100)
+    const total_ht = total_ttc / (1 + (tva_rate / 100));
+    const tva_amount = total_ttc - total_ht;
+
+    const locale = state.lang === 'fr' ? 'fr-FR' : 'en-US';
+    const fmt = (val) => new Intl.NumberFormat(locale, { minimumFractionDigits: 2 }).format(val) + ' ' + (expenseData.currency || 'MAD');
+
+    let body = `*${t('review_expense', state.lang)}*\n\n` +
+      `*${t('field_total_ht', state.lang)}:* ${fmt(total_ht)}\n` +
+      `*${t('field_tva_amount', state.lang)} (${tva_rate}%):* ${fmt(tva_amount)}\n` +
+      `*${t('field_total_ttc', state.lang)}:* ${fmt(total_ttc)}\n\n` +
       `*${t('field_date', state.lang)}:* ${expenseData.date || '---'}\n` +
-      `*${t('field_entity_supplier', state.lang)}:* ${expenseData.entity || '...'}\n` +
+      `*${t('field_entity_supplier', state.lang)}:* ${expenseData.supplier_name || expenseData.entity || '...'}\n` +
       `*${t('field_category', state.lang)}:* ${expenseData.category || '...'}\n` +
       `*${t('field_payment', state.lang)}:* ${localizedPayment}\n` +
+      `*${t('field_status', state.lang)}:* ${expenseData.status || '...'}\n` +
       `*${t('field_notes', state.lang)}:* ${notes}\n\n`;
 
     if (receiptPath) {
@@ -1808,7 +1990,7 @@ class WhatsAppController {
 
     // --- Official Tax Calculation (HT + TVA = TTC) ---
     const total_ht = parseFloat(invoiceData.amount || 0);
-    const tva_rate = parseFloat(invoiceData.tva_percentage || 0);
+    const tva_rate = parseFloat(invoiceData.tax_rate || invoiceData.tva_percentage || 0);
     const tva_amount = total_ht * (tva_rate / 100);
     const total_ttc = total_ht + tva_amount;
 
@@ -1820,7 +2002,7 @@ class WhatsAppController {
       `*${t('field_tva_amount', state.lang)} (${tva_rate}%):* ${fmt(tva_amount)}\n` +
       `*${t('field_total_ttc', state.lang)}:* ${fmt(total_ttc)}\n\n` +
       `*${t('field_date', state.lang)}:* ${invoiceData.date || '---'}\n` +
-      `*${t('field_entity_client', state.lang)}:* ${invoiceData.entity || '...'}\n` +
+      `*${t('field_entity_client', state.lang)}:* ${invoiceData.client_name || invoiceData.entity || '...'}\n` +
       `*${t('field_payment', state.lang)}:* ${localizedPayment}\n` +
       `*${t('field_status', state.lang)}:* ${invoiceData.status || '...'}\n` +
       `*${t('field_notes', state.lang)}:* ${notes}\n\n`;
@@ -1878,6 +2060,7 @@ class WhatsAppController {
       rows.splice(3, 0, { id: 'cat', title: t('field_category', state.lang) });
     }
 
+    rows.push({ id: 'btn_edit_status', title: t('field_status', state.lang) });
     rows.push({ id: 'desc', title: isInvoice ? t('field_notes', state.lang) : t('field_description', state.lang) });
     rows.push({ id: 'all', title: t('btn_resubmit', state.lang) });
     
@@ -1920,7 +2103,7 @@ class WhatsAppController {
     const state = await stateService.getUserState(from);
     const body = t('category_selection_prompt', state.lang);
     const rows = categories.slice(0, 9).map(cat => ({
-        id: (cat.name || cat).substring(0, 200),
+        id: cat.id ? `cat_${cat.id}` : (cat.name || cat).substring(0, 200),
         title: (cat.name || cat).substring(0, 24)
     }));
 
@@ -1954,6 +2137,16 @@ class WhatsAppController {
     return whatsappService.sendInteractiveButtons(from, body, buttons);
   }
 
+  async sendExpenseStatusButtons(from) {
+    const state = await stateService.getUserState(from);
+    const body = t('expense_status_prompt', state.lang); // We'll make sure this key exists or fallback
+    const buttons = [
+      { id: 'unpaid', title: t('status_issued', state.lang) },
+      { id: 'paid', title: t('status_paid', state.lang) }
+    ];
+    return whatsappService.sendInteractiveButtons(from, body, buttons);
+  }
+
   async handleOutgoingMessage(req, res) {
     const { to, text } = req.body;
     if (!to || !text) {
@@ -1974,17 +2167,183 @@ class WhatsAppController {
   async handleReportQuery(from, text) {
     const state = await stateService.getUserState(from);
     const filters = await aiService.parseReportQuery(text, from);
+    const responseType = filters.responseType || 'ARRAY';
+
+    logger.debug(`📊 [REPORT QUERY] Type: ${responseType}, Filters:`, filters);
+
+    // Guard against generic entity names (e.g. "account status") being treated as client names
+    const genericTerms = [
+        'account', 'status', 'compte', 'statut', 'dashboard', 'tableau', 'report', 'rapport', 'my', 'mon', 'ma', 'me',
+        'invoices', 'factures', 'facture', 'invoice', 'expenses', 'dépenses', 'dépense', 'expense', 'achat', 'achats',
+        'mes factures', 'mes dépenses', 'my invoices', 'my expenses', 'unpaid', 'unpaid invoices', 'impay', 'impayée'
+    ];
     
-    if (!filters.entityName) {
+    if (filters.entityName) {
+        const cleanEntity = String(filters.entityName).toLowerCase().trim();
+        logger.debug(`🔎 Checking entityName: "${cleanEntity}"`);
+        
+        if (genericTerms.includes(cleanEntity) || cleanEntity.includes('unpaid') || cleanEntity.includes('impay')) {
+            logger.debug(`🛡️ Generic entityName detected. Resetting to null.`);
+            filters.entityName = null;
+        }
+    }
+
+    // 🧠 AI HALLUCINATION OVERRIDE
+    const textLower = text.toLowerCase();
+    if (textLower.includes('unpaid') || textLower.includes('impay')) {
+        filters.dataType = 'invoices';
+        filters.field = 'unpaid';
+    }
+
+    // 0. Handle Creation Commands (ACTION)
+    // Only switch to ACTION if not already in a dedicated search state
+    const isSearchState = state.state === 'AWAITING_REPORT_SEARCH' || state.state === 'AWAITING_REPORT_NAME';
+    if (responseType === 'ACTION' && !isSearchState) {
+      // Redirect to regular parsing flow
+      stateService.clearUserState(from);
+      if (text.toLowerCase().includes('facture') || text.toLowerCase().includes('invoice')) {
+        stateService.setUserState(from, 'AWAITING_INVOICE_DATA');
+        return this.processMessage({ ...state, text: { body: text }, type: 'text', from });
+      } else {
+        stateService.setUserState(from, 'AWAITING_EXPENSE_DATA');
+        return this.processMessage({ ...state, text: { body: text }, type: 'text', from });
+      }
+    }
+
+    // 1. Handle BIT (Yes/No) questions
+    if (responseType === 'BIT') {
+      // Fallback: If it's a general status request misclassified as BIT, show status
+      if (!filters.entityName && (filters.dataType === 'general' || text.toLowerCase().includes('status') || text.toLowerCase().includes('statut'))) {
+          const stats = await laravelService.getAccountStatus(from, filters.month, filters.year, null, state.lang, filters.startDate, filters.endDate);
+          await whatsappService.sendTextMessage(from, t('fetching_status', state.lang));
+          return this.sendStatusInteractive(from, stats);
+      }
+      return this.handleYesNoQuery(from, filters, text);
+    }
+
+    if (!filters.entityName && responseType !== 'BIT') {
+      // Logic Fallback: Always trust explicit user keywords over AI classification
+      const textLower = text.toLowerCase();
+      if (textLower.includes('transaction') || textLower.includes('opération') || textLower.includes('mouvement') || textLower.includes('all')) {
+          filters.dataType = 'all';
+      } else if (textLower.includes('expense') || textLower.includes('dépense') || textLower.includes('achat') || textLower.includes('purchase')) {
+          filters.dataType = 'expenses';
+      } else if (textLower.includes('invoice') || textLower.includes('facture') || textLower.includes('sale') || textLower.includes('vente')) {
+          filters.dataType = 'invoices';
+      }
+
       // General status report
-      await whatsappService.sendTextMessage(from, t('fetching_status', state.lang));
-      const stats = await laravelService.getAccountStatus(from, filters.month, filters.year, null, state.lang);
-      const monthsLabel = state.lang === 'fr' 
-        ? ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
-        : ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
-      let periodStr = filters.month ? `${monthsLabel[filters.month-1]} ` : "";
-      periodStr += filters.year || (filters.month ? "" : t('this_month', state.lang).toLowerCase());
+      const stats = await laravelService.getAccountStatus(from, filters.month, filters.year, null, state.lang, filters.startDate, filters.endDate);
       
+      if (!stats) {
+        return whatsappService.sendTextMessage(from, t('error_general', state.lang));
+      }
+      
+      // 1. DECIMAL/INTEGER Responses (Stats-based)
+      if (responseType === 'DECIMAL' || responseType === 'INTEGER') {
+          // Single-request efficient reporting
+          const reportData = await laravelService.getReportingData(from, filters.month, filters.year, null, filters.startDate, filters.endDate);
+          
+          let total = 0;
+          if (filters.field === 'vat') {
+              total = reportData.cash_vat_sum || 0;
+          } else if (filters.field === 'unpaid') {
+              total = reportData.total_unpaid_sum || 0;
+          } else if (filters.field === 'expenses') {
+              total = reportData.expensesSum || 0;
+          } else {
+              total = reportData.salesSum || 0;
+          }
+
+          if (responseType === 'INTEGER') {
+              if (filters.dataType === 'expenses') {
+                  total = reportData.expensesCount || 0;
+              } else if (filters.dataType === 'invoices') {
+                  total = reportData.invoicesCount || 0;
+              } else {
+                  total = reportData.totalDocuments || 0;
+              }
+          }
+
+          const user = await laravelService.checkAuth(from);
+          const lang = user.bot_lang || 'en';
+          
+          const monthNames = {
+              en: ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+              fr: ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+          };
+          
+          let periodStr = reportData.month || (lang === 'fr' ? "Tout le temps" : "All Time");
+          
+          if (filters.startDate && filters.endDate) {
+              const start = new Date(filters.startDate);
+              const end = new Date(filters.endDate);
+              const options = { month: 'short', day: 'numeric' };
+              periodStr = `${start.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-US', options)} - ${end.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-US', options)}`;
+          }
+          
+          const labels = {
+              en: { 
+                  vat: "VAT collected", unpaid: "Total unpaid", expenses: "Total expenses", 
+                  revenue: "Total revenue", clients: "Number of clients",
+                  invoices_count: "Number of invoices", expenses_count: "Number of expenses",
+                  total_count: "Total documents"
+              },
+              fr: { 
+                  vat: "TVA collectée", unpaid: "Total impayé", expenses: "Total des dépenses", 
+                  revenue: "Total des revenus", clients: "Nombre de clients",
+                  invoices_count: "Nombre de factures", expenses_count: "Nombre de dépenses",
+                  total_count: "Total des documents"
+              }
+          };
+          
+          let fieldKey = 'revenue';
+          if (responseType === 'INTEGER') {
+              if (filters.dataType === 'expenses') fieldKey = 'expenses_count';
+              else if (filters.dataType === 'invoices') fieldKey = 'invoices_count';
+              else fieldKey = 'total_count';
+          } else {
+              if (filters.field === 'vat') fieldKey = 'vat';
+              else if (filters.field === 'unpaid') fieldKey = 'unpaid';
+              else if (filters.field === 'expenses') fieldKey = 'expenses';
+              else if (filters.field === 'clients') fieldKey = 'clients';
+          }
+          
+          const l = labels[lang] || labels.en;
+          
+          let displayTotal = total;
+          if (filters.field === 'clients') {
+              displayTotal = reportData.total_clients_count || 0;
+          }
+
+          const suffix = (responseType === 'INTEGER' || filters.field === 'clients') ? '' : ' MAD';
+          const formattedTotal = (responseType === 'INTEGER' || filters.field === 'clients') 
+            ? displayTotal 
+            : displayTotal.toLocaleString(lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+          const msg = `📊 *${l[fieldKey]} (${periodStr}):* ${formattedTotal}${suffix}`;
+
+          return whatsappService.sendTextMessage(from, msg);
+      }
+
+      // We fetch all and filter locally to ensure we catch all variants (ISSUED, UNPAID, etc.)
+      const status = null; 
+      const localFilter = filters.field === 'unpaid' ? (r) => (r.status || "").toUpperCase() !== 'PAID' : null;
+      
+      if (filters.dataType === 'expenses') {
+        return this.handleListTransactions(from, 'exp', null, filters.month, filters.year, filters.startDate, filters.endDate, 1, filters.limit, status, localFilter);
+      } else if (filters.dataType === 'invoices') {
+        // Only show General Alert if NO limit is provided
+        if (filters.field === 'unpaid' && !filters.limit) {
+            const fmtTotal = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(stats.total_unpaid_sum || 0) + ' MAD';
+            await whatsappService.sendTextMessage(from, t('alert_unpaid_total', state.lang, { total: fmtTotal, count: stats.unpaidInvoicesCount }));
+        }
+        return this.handleListTransactions(from, 'inv', null, filters.month, filters.year, filters.startDate, filters.endDate, 1, filters.limit, status, localFilter);
+      } else if (filters.dataType === 'all') {
+        return this.handleListTransactions(from, 'all', null, filters.month, filters.year, filters.startDate, filters.endDate, 1, filters.limit, status, localFilter);
+      }
+
+      await whatsappService.sendTextMessage(from, t('fetching_status', state.lang));
       return this.sendStatusInteractive(from, stats);
     }
 
@@ -2047,6 +2406,26 @@ class WhatsAppController {
     if (totalMatches === 1) {
       const entity = matchedClients[0] || matchedSuppliers[0];
       const isClient = !!matchedClients[0];
+
+      if (responseType === 'INTEGER' || responseType === 'DECIMAL') {
+        const stats = await laravelService.getAccountStatus(from, filters.month, filters.year, entity.id, state.lang);
+        if (responseType === 'INTEGER') {
+          let count = stats.totalDocuments;
+          if (filters.field === 'unpaid') count = stats.invoicesCount;
+          else if (filters.dataType === 'expenses') count = stats.expensesCount;
+          else if (filters.dataType === 'invoices') count = stats.invoicesCount;
+          return whatsappService.sendTextMessage(from, `${count}`);
+        }
+        if (responseType === 'DECIMAL') {
+          let sum = stats.salesSum - stats.expensesSum;
+          if (filters.field === 'vat') sum = stats.cash_vat_sum;
+          else if (filters.field === 'revenue') sum = stats.salesSum;
+          else if (filters.field === 'expenses') sum = stats.expensesSum;
+          else if (filters.field === 'unpaid') sum = stats.total_unpaid_sum;
+          return whatsappService.sendTextMessage(from, `${sum.toFixed(2)}`);
+        }
+      }
+
       return this.sendFilteredReport(from, entity, isClient, filters);
     }
 
@@ -2086,6 +2465,166 @@ class WhatsAppController {
     stateService.setUserState(from, 'AWAITING_REPORT_DISAMBIGUATION', { filters });
   }
 
+  async handleYesNoQuery(from, filters, text) {
+    const state = await stateService.getUserState(from);
+    const idents = (filters && filters.identifiers) ? filters.identifiers : {};
+    if (!filters) filters = { dataType: 'invoices' }; // Default if null
+    
+    // 🔍 MANUAL FALLBACK: If AI missed the document number, try extracting it via regex
+    // Only match if it looks like a real reference (contains digits)
+    if (!idents.invoiceNumber && text) {
+        const refMatch = text.match(/(INV|EXP|BILL|REF|FA|DE)[-\s\w]*\d+[-\s\w\d]*/i);
+        if (refMatch) {
+            idents.invoiceNumber = refMatch[0].trim();
+            logger.debug(`🛡️ REGEX FALLBACK EXTRACTED: "${idents.invoiceNumber}"`);
+        }
+    }
+
+    // 🧠 MEMORY PRIORITY: If no valid search criteria was found, use the last viewed document
+    if (!idents.invoiceNumber && !idents.clientName && !idents.amount && !idents.date) {
+        if (state.data.lastRecordId) {
+            idents.id = state.data.lastRecordId;
+            filters.dataType = state.data.lastRecordType;
+            logger.debug(`🧠 CONTEXTUAL RECALL: Using last record ${idents.id} (${filters.dataType})`);
+        }
+    }
+    
+    // Final check: If still no identifier, ask the user
+    if (!idents.invoiceNumber && !idents.clientName && !idents.amount && !idents.date && !idents.id) {
+        const reply = state.lang === 'fr' 
+            ? "De quelle facture ou dépense parlez-vous ? Veuillez envoyer le numéro de facture, le nom du client, le montant ou la date."
+            : "Which invoice or expense do you mean? Please send the invoice number, client name, amount, or date.";
+        
+        logger.debug(`💾 SAVING CONTEXT: AWAITING_IDENTIFIER for "${text}"`);
+        stateService.setUserState(from, 'AWAITING_IDENTIFIER', { originalQuery: text });
+        return whatsappService.sendTextMessage(from, reply);
+    }
+
+    const type = filters.dataType || 'invoices';
+    let records = [];
+
+    if (type === 'invoices') {
+        records = await laravelService.getInvoices(from, null, filters.month, filters.year, null, null, null, idents.invoiceNumber || idents.id);
+    } else {
+        records = await laravelService.getExpenses(from, filters.month, filters.year, null, idents.id);
+    }
+
+    // Filter by identifiers if multiple returned
+    if (records.length > 1) {
+        if (idents.amount) records = records.filter(r => parseFloat(r.amount || r.total_ttc) === parseFloat(idents.amount));
+        if (idents.clientName) records = records.filter(r => (r.client_name || r.supplier_name || "").toLowerCase().includes(idents.clientName.toLowerCase()));
+    }
+
+    if (records.length === 0) {
+        // Fallback: If exact match failed, try fetching recent records and filtering locally (punctuation insensitive)
+        const recentRecords = type === 'invoices' 
+            ? await laravelService.getInvoices(from, null, filters.month, filters.year)
+            : await laravelService.getExpenses(from, filters.month, filters.year);
+        
+        const cleanSearch = String(idents.invoiceNumber || idents.id || "").toLowerCase().replace(/[^a-z0-9]/g, '');
+        
+        if (cleanSearch) {
+            records = recentRecords.filter(doc => {
+                const ref = (doc.invoice_number || doc.expense_number || '').toLowerCase();
+                const cleanRef = ref.replace(/[^a-z0-9]/g, '');
+                return cleanRef.includes(cleanSearch) || cleanSearch.includes(cleanRef);
+            });
+        }
+
+        if (records.length === 0) {
+            const reply = state.lang === 'fr' ? "Je n'ai pas trouvé ce document." : "I couldn't find that document.";
+            return whatsappService.sendTextMessage(from, reply);
+        }
+    }
+
+    if (records.length > 1) {
+        const buttons = records.slice(0, 3).map(r => {
+            const ref = r.invoice_number || r.number || `#${r.id}`;
+            const amount = r.total_ttc || r.amount || 0;
+            const date = r.date ? r.date.split('T')[0] : '';
+            return {
+                id: `sel_${type.substring(0,1)}_${r.id}`,
+                title: `${ref} - ${amount} MAD`
+            };
+        });
+
+        const reply = state.lang === 'fr' 
+            ? `J'ai trouvé ${records.length} documents. Lequel voulez-vous vérifier ?` 
+            : `I found ${records.length} documents. Which one do you want to check?`;
+            
+        return whatsappService.sendInteractiveButtons(from, reply, buttons);
+    }
+
+    const record = records[0];
+    if (!record) {
+        logger.error('❌ Record identified as undefined!', { recordsCount: records.length });
+        const reply = state.lang === 'fr' ? "Erreur lors de la récupération du document." : "Error retrieving the document.";
+        return whatsappService.sendTextMessage(from, reply);
+    }
+    
+    logger.debug(`📄 INSPECTING RECORD: ${record.invoice_number || record.expense_number} - Type: ${type}`, { 
+        hasReviewStatus: record.hasOwnProperty('review_status'),
+        reviewStatus: record.review_status 
+    });
+    
+    // Store for context
+    if (!state.data) state.data = {};
+    state.data.lastRecordId = record.id;
+    state.data.lastRecordType = type;
+    await stateService.setUserState(from, state.state, state.data);
+
+    // Answer Yes/No (BIT)
+    const textLower = text.toLowerCase();
+    const isPaidQuery = textLower.includes('paid') || textLower.includes('payé');
+    const isVatQuery = textLower.includes('vat') || textLower.includes('tva') || textLower.includes('tax');
+    const isValidatedQuery = textLower.includes('validate') || textLower.includes('validé') || textLower.includes('approve');
+
+    if (isPaidQuery) {
+        const status = (record.status || record.payment_status || "").toLowerCase();
+        const isPaid = status === 'paid' || status === 'payé';
+        
+        if (isPaid) {
+            return whatsappService.sendTextMessage(from, state.lang === 'fr' ? "Oui, ce document est payé. ✅" : "Yes, this document is paid. ✅");
+        } else {
+            return whatsappService.sendTextMessage(from, state.lang === 'fr' ? "❌ Non, ce document est toujours impayé." : "No, this document is still unpaid. ❌");
+        }
+    }
+
+    if (isVatQuery) {
+        const taxRate = parseFloat(record.tax_rate || record.tva_percentage || record.tax_percentage || 0);
+        const taxAmount = parseFloat(record.tax_amount || record.total_tva || record.total_tax || record.tva || 0);
+        
+        if (taxRate > 0 || taxAmount > 0) {
+            const msg = state.lang === 'fr' ? `Oui, une taxe de ${taxRate > 0 ? taxRate + '%' : taxAmount + ' MAD'} est appliquée. 📈` : `Yes, a tax of ${taxRate > 0 ? taxRate + '%' : taxAmount + ' MAD'} is applied. 📈`;
+            return whatsappService.sendTextMessage(from, msg);
+        } else {
+            return whatsappService.sendTextMessage(from, state.lang === 'fr' ? "Non, aucune TVA n'est appliquée sur ce document. ⚪" : "No, there is no VAT applied on this document. ⚪");
+        }
+    }
+
+    if (isValidatedQuery) {
+        // Expenses don't have a review_status column and are considered auto-validated upon entry
+        if (type === 'expenses' || !record.hasOwnProperty('review_status')) {
+            return whatsappService.sendTextMessage(from, state.lang === 'fr' ? "Les dépenses sont enregistrées automatiquement et ne nécessitent pas de validation manuelle. ✅" : "Expenses are recorded automatically and do not require manual validation. ✅");
+        }
+
+        const reviewStatus = (record.review_status || "").toLowerCase();
+        const isValidated = reviewStatus === 'validated' || reviewStatus === 'validé' || reviewStatus === 'approved';
+        
+        if (isValidated) {
+            return whatsappService.sendTextMessage(from, state.lang === 'fr' ? "Oui, ce document est validé. ✅" : "Yes, this document is validated. ✅");
+        } else if (reviewStatus === 'rejected' || reviewStatus === 'rejeté') {
+            return whatsappService.sendTextMessage(from, state.lang === 'fr' ? "❌ Non, ce document a été rejeté." : "No, this document has been rejected. ❌");
+        } else {
+            return whatsappService.sendTextMessage(from, state.lang === 'fr' ? "Ce document est toujours en attente de validation. ⏳" : "This document is still awaiting validation. ⏳");
+        }
+    }
+
+    // Default confirmation if record exists
+    const reply = state.lang === 'fr' ? "J'ai bien trouvé le document." : "I found the document.";
+    return whatsappService.sendTextMessage(from, reply);
+  }
+
   /**
    * Resolves disambiguation click
    */
@@ -2106,12 +2645,42 @@ class WhatsAppController {
       return;
     }
 
-    if (state.data.filters && (state.data.filters.month || state.data.filters.year)) {
-      await this.sendFilteredReport(from, entity, isClient, state.data.filters);
+    const filters = state.data.filters || {};
+    const responseType = filters.responseType || 'ARRAY';
+
+    // Handle Precision Mode (INTEGER, DECIMAL) after selection
+    if (responseType === 'INTEGER' || responseType === 'DECIMAL') {
+        const stats = await laravelService.getAccountStatus(from, filters.month, filters.year, entity.id, state.lang);
+        stateService.clearUserState(from);
+        
+        if (responseType === 'INTEGER') {
+            let count = stats.totalDocuments;
+            if (filters.field === 'unpaid') count = stats.invoicesCount;
+            else if (filters.dataType === 'expenses') count = stats.expensesCount;
+            else if (filters.dataType === 'invoices') count = stats.invoicesCount;
+            return whatsappService.sendTextMessage(from, `${count}`);
+        }
+        
+        if (responseType === 'DECIMAL') {
+            let sum = stats.salesSum - stats.expensesSum;
+            if (filters.field === 'vat') sum = stats.cash_vat_sum;
+            else if (filters.field === 'revenue') sum = stats.salesSum;
+            else if (filters.field === 'expenses') sum = stats.expensesSum;
+            else if (filters.field === 'unpaid') sum = stats.total_unpaid_sum;
+            return whatsappService.sendTextMessage(from, `${sum.toFixed(2)}`);
+        }
+    }
+
+    if (responseType === 'BIT') {
+        return this.handleYesNoQuery(from, filters, ""); // Entity is now locked via disambiguation
+    }
+
+    if (filters.month || filters.year) {
+      await this.sendFilteredReport(from, entity, isClient, filters);
       stateService.clearUserState(from);
     } else {
       // Store the full entity so AWAITING_REPORT_PERIOD can use it directly
-      stateService.setUserState(from, 'AWAITING_REPORT_PERIOD', { entityId, isClient, entity });
+      stateService.setUserState(from, 'AWAITING_REPORT_PERIOD', { entityId, isClient, entity, filters });
       await this.sendReportPeriodButtons(from);
     }
   }
@@ -2235,72 +2804,161 @@ class WhatsAppController {
   /**
    * Drill-down handler for specific transaction lists
    */
-  async handleListTransactions(from, type, entityId, month, year) {
+  async handleListTransactions(from, type, entityId, month, year, startDate = null, endDate = null, page = 1, limit = null, status = null, localFilter = null) {
     const state = await stateService.getUserState(from);
     try {
+      const months = state.lang === 'fr' 
+        ? ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+        : ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+      
+      let periodLabel = (startDate && endDate) ? `${startDate} to ${endDate}` : (month ? `${months[month-1]} ${year}` : t('all_time', state.lang));
+
       // 1. Fetch data
       let transactions = [];
       let title = "";
 
-      if (type === 'inv') {
-        transactions = await laravelService.getInvoices(from, null, month, year, entityId);
-        title = t('recent_invoices', state.lang);
+      if (type === 'all') {
+        const [invs, exps] = await Promise.all([
+          laravelService.getInvoices(from, null, month, year, entityId, startDate, endDate),
+          laravelService.getExpenses(from, month, year, entityId, startDate, endDate)
+        ]);
+        transactions = [
+          ...invs.map(i => ({ ...i, bot_type: 'inv' })),
+          ...exps.map(e => ({ ...e, bot_type: 'exp' }))
+        ];
+        transactions.sort((a, b) => new Date(b.date || b.issue_date || b.created_at) - new Date(a.date || a.issue_date || a.created_at));
+        title = state.lang === 'fr' ? 'Toutes les Transactions' : 'All Transactions';
+      } else if (type === 'inv') {
+        transactions = await laravelService.getInvoices(from, status, month, year, entityId, startDate, endDate);
+        title = status === 'unpaid' ? (state.lang === 'fr' ? 'Factures Impayées' : 'Unpaid Invoices') : t('recent_invoices', state.lang);
       } else {
-        transactions = await laravelService.getExpenses(from, month, year, entityId);
+        transactions = await laravelService.getExpenses(from, month, year, entityId, startDate, endDate);
         title = t('recent_expenses', state.lang);
+      }
+      
+      logger.debug(`🔍 [TRANSACTION LIST] Initial count: ${transactions.length} for type: ${type}`);
+      
+      // 2. Manual Filter (Fail-safe for backend inconsistencies)
+      if (startDate && endDate) {
+        const start = new Date(startDate);
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+
+        transactions = transactions.filter(t => {
+          const rawDate = t.date || t.issue_date || t.created_at;
+          const tDate = new Date(rawDate);
+          return tDate >= start && tDate <= end;
+        });
+        logger.debug(`🔍 [TRANSACTION LIST] After manual filter: ${transactions.length}`);
+      }
+
+      // 1b. Apply Local Filter (if provided)
+      if (localFilter && typeof localFilter === 'function') {
+          transactions = transactions.filter(localFilter);
+          logger.debug(`🔍 [TRANSACTION LIST] After local filter: ${transactions.length}`);
+      }
+
+      // 1b. Smart Fallback: If list is empty AFTER filtering, show ALL recent items
+      if (transactions.length === 0 && (startDate || month)) {
+          logger.debug(`⚠️ NO TRANSACTIONS for period. Falling back to all-time recent.`);
+          if (type === 'all') {
+              const [invs, exps] = await Promise.all([
+                  laravelService.getInvoices(from),
+                  laravelService.getExpenses(from)
+              ]);
+              transactions = [...invs.map(i => ({ ...i, bot_type: 'inv' })), ...exps.map(e => ({ ...e, bot_type: 'exp' }))];
+              transactions.sort((a, b) => new Date(b.date || b.issue_date || b.created_at) - new Date(a.date || a.issue_date || a.created_at));
+          } else if (type === 'inv') {
+              transactions = await laravelService.getInvoices(from);
+          } else {
+              transactions = await laravelService.getExpenses(from);
+          }
+          transactions = transactions.slice(0, 5); // Just show the top 5 most recent ever
+          title = (state.lang === 'fr' ? 'Récents: ' : 'Recent Activity: ') + title;
+          periodLabel = t('all_time', state.lang); // Correct the label since we are showing history
+          
+          // Send a separate clarifying message so the user knows 'today' was empty
+          const periodName = (startDate && endDate && startDate === endDate) ? (state.lang === 'fr' ? "aujourd'hui" : "today") : (state.lang === 'fr' ? "cette période" : "this period");
+          await whatsappService.sendTextMessage(from, `ℹ️ ${state.lang === 'fr' ? `Aucune transaction trouvée pour ${periodName}. Voici vos activités récentes :` : `No transactions found for ${periodName}. Here is your recent activity instead:`}`);
+          
+          logger.debug(`🔍 [TRANSACTION LIST] Fallback complete. New count: ${transactions.length}`);
+      }
+
+      // 3. Apply Limit if provided (e.g., "last 5")
+      if (limit && limit > 0) {
+          transactions = transactions.slice(0, limit);
       }
 
       if (transactions.length === 0) {
         return whatsappService.sendTextMessage(from, t('no_transactions_found', state.lang));
       }
 
-      // 2. Format list
-      const months = state.lang === 'fr' 
-        ? ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
-        : ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+      // 4. Pagination & Count (Measured AFTER filtering and limiting)
+      const totalCount = transactions.length;
+      const pageSize = 10;
+      const recordsPerPage = 9; // 9 records + 1 "Next Page" row
       
-      const periodStr = month ? `${months[month-1]} ${year || ''}` : (year ? year : t('all_time', state.lang));
-      
+      const totalPages = Math.ceil(totalCount / recordsPerPage);
+      const hasMore = page < totalPages;
+      const startIndex = (page - 1) * recordsPerPage;
+      const pagedList = transactions.slice(startIndex, startIndex + (hasMore ? recordsPerPage : pageSize));
+
+      // 4. Calculate Total Sum (On the final filtered list)
       let totalSum = 0;
       let currency = 'MAD';
-
       transactions.forEach((transaction) => {
           let amount = 0;
-          if (type === 'inv') {
-              amount = (transaction.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0);
+          if (transaction.bot_type === 'inv') {
+              const articles = transaction.articles || transaction.items || transaction.invoice_products || [];
+              amount = articles.reduce((sum, art) => sum + parseFloat(art.total_price_ht || art.price_ht || 0), 0);
+              if (amount === 0) amount = parseFloat(transaction.amount || transaction.total || 0);
           } else {
-              amount = parseFloat(transaction.total_ttc || transaction.ttc || 0);
+              amount = parseFloat(transaction.total_ttc || transaction.ttc || transaction.amount || 0);
           }
           totalSum += amount;
           if (transaction.currency) currency = transaction.currency;
       });
 
-      const rows = transactions.slice(0, 10).map((transaction) => {
-        const date = transaction.date ? new Date(transaction.date).toLocaleDateString(state.lang === 'fr' ? 'fr-FR' : 'en-GB') : 'N/A';
+      const rows = pagedList.map((transaction) => {
+        const rawDate = transaction.date || transaction.issue_date || transaction.created_at;
+        const date = rawDate ? new Date(rawDate).toLocaleDateString(state.lang === 'fr' ? 'fr-FR' : 'en-GB') : 'N/A';
         
         let amount = 0;
         if (type === 'inv') {
-          amount = (transaction.articles || []).reduce((sum, art) => sum + parseFloat(art.total_price_ht || 0), 0);
+          const articles = transaction.articles || transaction.items || transaction.invoice_products || [];
+          amount = articles.reduce((sum, art) => sum + parseFloat(art.total_price_ht || art.price_ht || 0), 0);
+          // Fallback if articles are empty or zero
+          if (amount === 0) amount = parseFloat(transaction.amount || transaction.total || 0);
         } else {
-          amount = parseFloat(transaction.total_ttc || transaction.ttc || 0);
+          amount = parseFloat(transaction.total_ttc || transaction.ttc || transaction.amount || 0);
         }
 
+        const icon = transaction.bot_type === 'exp' ? '🏷️' : ((transaction.status || "").toLowerCase() === 'paid' ? '🟢' : '🔴');
         const fmtAmount = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + (transaction.currency || currency);
         const prefix = type === 'inv' ? 'v_inv_' : 'v_exp_';
 
         return {
            id: `${prefix}${transaction.id}`,
-           title: `${date} — ${fmtAmount}`,
+           title: `${icon} ${date} — ${fmtAmount}`,
            description: transaction.notes || (type === 'inv' ? t('field_invoice_num', state.lang) + ` Ref: ${transaction.id}` : t('field_expense_num', state.lang) + ` Ref: ${transaction.id}`)
         };
       });
 
+      // Add Pagination Row
+      if (hasMore) {
+          rows.push({
+              id: `next_page_${type}_${month || 0}_${year || 0}_${page + 1}_${startDate || 'none'}_${endDate || 'none'}`,
+              title: "➡️ " + (state.lang === 'fr' ? "Page Suivante" : "Next Page"),
+              description: (state.lang === 'fr' ? "Voir les 10 suivants" : "View next 10 items")
+          });
+      }
+
       const fmtTotal = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(totalSum) + ' ' + currency;
-      
       const bodyText = `*${title}*\n` +
-                       `📅 *${t('field_period', state.lang)}:* ${periodStr}\n` +
-                       `💰 *Total:* ${fmtTotal}\n\n` +
-                       t('records_found_msg', state.lang, { count: transactions.length });
+                       `📅 *${t('field_period', state.lang)}:* ${periodLabel}\n` +
+                       `💰 *Total (HT):* ${fmtTotal}\n\n` +
+                       t('records_found_msg', state.lang, { count: totalCount }) + 
+                       (totalPages > 1 ? ` (Page ${page}/${totalPages})` : "");
 
       const sections = [{
           title: t('select_document', state.lang),
@@ -2324,16 +2982,16 @@ class WhatsAppController {
       let label = "";
 
       if (type === 'inv') {
-        const results = await laravelService.getInvoices(from, null, null, null, null, id);
+        const results = await laravelService.getInvoices(from, null, null, null, null, null, null, id);
         document = results.length > 0 ? results[0] : null;
         label = "Invoice";
       } else {
-        const results = await laravelService.getExpenses(from, null, null, null, id);
+        const results = await laravelService.getExpenses(from, null, null, null, null, null, id);
         document = results.length > 0 ? results[0] : null;
         label = "Expense";
       }
 
-      if (document.articles) {
+      if (document && document.articles) {
           logger.debug(`🔍 [DOCUMENT MATCHED] Type: ${type}, ID: ${id}`);
       }
 
@@ -2341,7 +2999,8 @@ class WhatsAppController {
         return whatsappService.sendTextMessage(from, t('error_media_delivery', state.lang, { label, id }));
       }
 
-      const date = document.date ? new Date(document.date).toLocaleDateString('en-GB') : 'N/A';
+      const rawDate = document.date || document.issue_date || document.created_at;
+      const date = rawDate ? new Date(rawDate).toLocaleDateString('en-GB') : 'N/A';
       
       // Fetch tax resources to map ID to rate (Bot-Side API Map)
       const taxResources = await laravelService.getTaxes(from);
@@ -2376,29 +3035,49 @@ class WhatsAppController {
             }, 0);
         }
       } else {
-        amountHT = parseFloat(document.net_amount || document.amount || document.total_ttc || 0);
-        tvaAmount = parseFloat(document.total_tva || document.tax_amount || 0);
-        tvaRate = document.tax_rate || 0;
+        const fullTtc = parseFloat(document.total_ttc || document.ttc || 0);
+        tvaAmount = parseFloat(document.total_tva || 0);
+        amountHT = fullTtc - tvaAmount;
+        tvaRate = parseFloat(document.tva || document.tax_rate || 0);
       }
 
       const locale = state.lang === 'fr' ? 'fr-FR' : 'en-US';
       const currency = document.currency || 'MAD';
+      const totalTTC = amountHT + tvaAmount;
+
       const fmtHT = new Intl.NumberFormat(locale, { minimumFractionDigits: 2 }).format(amountHT) + ' ' + currency;
       const fmtVat = new Intl.NumberFormat(locale, { minimumFractionDigits: 2 }).format(tvaAmount) + ' ' + currency;
+      const fmtTTC = new Intl.NumberFormat(locale, { minimumFractionDigits: 2 }).format(totalTTC) + ' ' + currency;
+
       const entityName = type === 'inv' ? (document.client?.client_name || 'N/A') : (document.supplier?.supplier_name || 'N/A');
       const entityLabelText = type === 'inv' ? t('label_client', state.lang) : t('label_supplier', state.lang);
       const notesText = document.notes || document.description || 'N/A';
       const vatLabel = state.lang === 'fr' ? 'TVA' : 'VAT';
+
+      // Human-friendly status mapping
+      let displayStatus = document.status || t('recorded_successfully_short', state.lang);
+      if (displayStatus.toUpperCase() === 'ISSUED') {
+          displayStatus = state.lang === 'fr' ? 'Impayée' : 'Unpaid';
+      } else if (displayStatus.toUpperCase() === 'PAID') {
+          displayStatus = state.lang === 'fr' ? 'Payée' : 'Paid';
+      }
 
       const successText = `🧾 *${t('media_doc_title', state.lang, { label: label.toUpperCase() })}*\n` +
                           `━━━━━━━━━━━━━━━━━━\n` +
                           `🏢 *${entityLabelText}:* ${entityName}\n` +
                           `💰 *Total HT:* ${fmtHT}\n` +
                           `📉 *${vatLabel} (${tvaRate}%):* ${fmtVat}\n` +
+                          `💵 *Total TTC:* ${fmtTTC}\n` +
                           `📅 *${t('field_date', state.lang)}:* ${date}\n` +
                           `📝 *${t('field_notes', state.lang)}:* ${notesText}\n` +
                           `━━━━━━━━━━━━━━━━━━\n` +
-                          `✅ *Status:* ${document.status || t('recorded_successfully_short', state.lang)}`;
+                          `✅ *Status:* ${displayStatus}`;
+      
+      // 🧠 MEMORY SAVE: Ensure the bot remembers this document for follow-up questions (is this paid? etc.)
+      if (!state.data) state.data = {};
+      state.data.lastRecordId = id;
+      state.data.lastRecordType = type === 'inv' ? 'invoices' : 'expenses';
+      await stateService.setUserState(from, state.state, state.data);
       
       const isPdfRoute = document.download_url.includes('/pdf');
       const isImage = document.document_path && (
@@ -2407,11 +3086,15 @@ class WhatsAppController {
           document.document_path.toLowerCase().endsWith('.png')
       );
 
+      const extension = isPdfRoute || type === 'inv' ? '.pdf' : (document.document_path ? path.extname(document.document_path) : '.pdf');
+      const mediaUrl = document.download_url.replace('http://localhost:8000', config.botPublicUrl);
+      
+      logger.debug(`📤 [DELIVERING MEDIA] Type: ${type}, Ext: ${extension}, URL: ${mediaUrl}`);
+
       if (!isPdfRoute && isImage) {
-          await whatsappService.sendImage(from, document.download_url, successText);
+          await whatsappService.sendImage(from, mediaUrl, successText);
       } else {
-          const extension = document.document_path ? path.extname(document.document_path) : '.pdf';
-          await whatsappService.sendDocument(from, document.download_url, `${label}_${id}${extension}`, successText);
+          await whatsappService.sendDocument(from, mediaUrl, `${label}_${id}${extension}`, successText);
       }
 
     } catch (error) {

@@ -22,6 +22,7 @@ const handleProxy = async (req, res, next) => {
             url: targetUrl,
             headers: { 
                 ...req.headers,
+                'X-Bot-Secret': config.botSecret,
                 'ngrok-skip-browser-warning': 'true', 
                 'X-Forwarded-Host': req.headers.host,
                 'X-Forwarded-Proto': req.headers['x-forwarded-proto'] || 'https'

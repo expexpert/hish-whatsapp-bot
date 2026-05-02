@@ -96,7 +96,7 @@ class LaravelService {
   /**
    * Get dynamic dashboard stats for a specific phone number
    */
-  async getAccountStatus(phone, targetMonth = null, targetYear = null, entityId = null, lang = 'fr') {
+  async getAccountStatus(phone, targetMonth = null, targetYear = null, entityId = null, lang = 'fr', startDate = null, endDate = null) {
     const rawTargetMonth = targetMonth;
     const rawTargetYear = targetYear;
     
@@ -106,8 +106,11 @@ class LaravelService {
       
       const params = {};
       
-      // Only apply date filters if a specific month/year is requested
-      if (rawTargetMonth) {
+      if (startDate && endDate) {
+          // Precise range from AI
+          params.date_from = startDate;
+          params.date_to = endDate;
+      } else if (rawTargetMonth) {
           // Both month and year
           const currentMonthIdx = parseInt(rawTargetMonth) - 1;
           const monthNum = String(currentMonthIdx + 1).padStart(2, '0');
@@ -142,7 +145,12 @@ class LaravelService {
       const locale = lang === 'fr' ? 'fr-FR' : 'en-US';
       let periodLabel = lang === 'fr' ? "Tout le temps" : "All Time";
 
-      if (rawTargetMonth) {
+      if (startDate && endDate) {
+          const start = new Date(startDate);
+          const end = new Date(endDate);
+          const options = { month: 'short', day: 'numeric', year: 'numeric' };
+          periodLabel = `${start.toLocaleDateString(locale, options)} - ${end.toLocaleDateString(locale, options)}`;
+      } else if (rawTargetMonth) {
           const currentMonthIdx = parseInt(rawTargetMonth) - 1;
           const displayDate = new Date(currentYear, currentMonthIdx, 1);
           periodLabel = displayDate.toLocaleString(locale, { month: 'long', year: 'numeric' });
@@ -155,10 +163,11 @@ class LaravelService {
         status: data.is_enable_login ? 'Active' : 'Pending',
         totalDocuments: (parseInt(data.total_issued_count) || 0) + (parseInt(data.total_paid_count) || 0) + (parseInt(data.total_expenses_count) || 0),
         invoicesCount: (parseInt(data.total_issued_count) || 0) + (parseInt(data.total_paid_count) || 0),
+        unpaidInvoicesCount: parseInt(data.unpaidInvoicesCount) || parseInt(data.total_issued_count) || 0,
         expensesCount: parseInt(data.total_expenses_count) || 0,
 
         // Core Financials (Mapped to Main Branch Logic)
-        salesSum: parseFloat(data.total_issued_paid_sum) || 0,
+        salesSum: parseFloat(data.total_ht_sum) || 0,
         cash_revenue_sum: parseFloat(data.total_paid_sum) || 0,
         total_unpaid_sum: parseFloat(data.unpaidInvoiceSum) || 0,
         total_quote_sum: parseFloat(data.total_quote_sum) || 0,
@@ -168,9 +177,9 @@ class LaravelService {
         pendingReviewCount: parseInt(data.total_pending_review_count) || 0,
         statementsCount: parseInt(data.bank_statements_count) || 0,
         
-        expensesSum: parseFloat(data.total_expenses_sum) || 0,
-        total_expenses_sum: parseFloat(data.total_expenses_sum) || 0,
-        expenseVat: parseFloat(data.total_expenses_vat) || 0,
+        expensesSum: parseFloat(data.bot_total_sum) || 0,
+        total_expenses_sum: parseFloat(data.bot_total_sum) || 0,
+        expenseVat: parseFloat(data.bot_total_tva) || 0,
         vatPayable: parseFloat(data.total_vat_payable) || 0,
         recentDocuments: [],
         targetMonth: rawTargetMonth ? String(rawTargetMonth).padStart(2, '0') : null,
@@ -214,10 +223,13 @@ class LaravelService {
   /**
    * Fetches dashboard data and formats it for the bot
    */
-  async getReportingData(phone, month = null, year = null, lang = 'en') {
+  async getReportingData(phone, month = null, year = null, lang = 'en', startDate = null, endDate = null) {
     try {
       const params = {};
-      if (month && year) {
+      if (startDate && endDate) {
+        params.date_from = startDate;
+        params.date_to = endDate;
+      } else if (month && year) {
         params.date_from = `${year}-${month}-01`;
         params.date_to = new Date(year, month, 0).toISOString().split('T')[0];
       }
@@ -252,9 +264,9 @@ class LaravelService {
         pendingReviewCount: parseInt(data.total_pending_review_count) || 0,
         statementsCount: parseInt(data.bank_statements_count) || 0,
         
-        expensesSum: parseFloat(data.total_expenses_sum) || 0,
-        total_expenses_sum: parseFloat(data.total_expenses_sum) || 0,
-        expenseVat: parseFloat(data.total_expenses_vat) || 0,
+        expensesSum: parseFloat(data.bot_total_sum) || 0,
+        total_expenses_sum: parseFloat(data.bot_total_sum) || 0,
+        expenseVat: parseFloat(data.bot_total_tva) || 0,
         vatPayable: parseFloat(data.total_vat_payable) || 0,
         recentDocuments: [],
         targetMonth: monthNum,
@@ -285,26 +297,68 @@ class LaravelService {
     }
   }
 
-  async getInvoices(phone, status = null, month = null, year = null, clientId = null, id = null) {
+  async getInvoices(phone, status = null, month = null, year = null, clientId = null, startDate = null, endDate = null, id = null) {
     try {
+      const params = { status, client_id: clientId, sort: 'recent' };
+      
+      if (id) {
+        // If ID is provided, check if it's a numeric ID or an alphanumeric reference
+        if (typeof id === 'string' && (id.includes('-') || id.includes(' ') || isNaN(id))) {
+            params.invoice_number = id;
+        } else {
+            params.id = id;
+        }
+      } else if (startDate && endDate) {
+        params.date_from = startDate;
+        params.date_to = endDate;
+      } else if (month && year) {
+        params.date_from = `${year}-${String(month).padStart(2, '0')}-01`;
+        params.date_to = new Date(year, month, 0).toISOString().split('T')[0];
+        params.month = month;
+        params.year = year;
+      }
+
+      logger.debug(`📥 Fetching Invoices: ${this.baseUrl}/customer/customer-invoices`, { params });
       const response = await axios.get(`${this.baseUrl}/customer/customer-invoices`, {
-        params: { status, month, year, client_id: clientId, id },
+        params,
         headers: this.getBotHeaders(phone)
       });
-      return response.data.data || [];
+      const data = response.data.data;
+      return (data && data.invoices) ? data.invoices : (data || []);
     } catch (error) {
       console.error('getInvoices error:', error.message);
       return [];
     }
   }
 
-  async getExpenses(phone, month = null, year = null, supplierId = null, id = null) {
+  async getExpenses(phone, month = null, year = null, supplierId = null, startDate = null, endDate = null, id = null) {
     try {
+      const params = { supplier_id: supplierId, sort: 'recent' };
+
+      if (id) {
+        // If ID is provided, check if it's a numeric ID or an alphanumeric reference
+        if (typeof id === 'string' && (id.includes('-') || id.includes(' ') || isNaN(id))) {
+            params.expense_number = id;
+        } else {
+            params.id = id;
+        }
+      } else if (startDate && endDate) {
+        params.date_from = startDate;
+        params.date_to = endDate;
+      } else if (month && year) {
+        params.date_from = `${year}-${String(month).padStart(2, '0')}-01`;
+        params.date_to = new Date(year, month, 0).toISOString().split('T')[0];
+        params.month = month;
+        params.year = year;
+      }
+
+      logger.debug(`📥 Fetching Expenses: ${this.baseUrl}/customer/customer-expenses`, { params });
       const response = await axios.get(`${this.baseUrl}/customer/customer-expenses`, {
-        params: { month, year, supplier_id: supplierId, id },
+        params,
         headers: this.getBotHeaders(phone)
       });
-      return response.data.data || [];
+      const data = response.data.data;
+      return (data && data.expenses) ? data.expenses : (data || []);
     } catch (error) {
       console.error('getExpenses error:', error.message);
       return [];
@@ -340,12 +394,22 @@ class LaravelService {
       const fs = require('fs');
       const form = new FormData();
       
-      // Map Bot fields to standard API fields (and include names for Trait mapping)
-      form.append('ttc', data.amount);
-      form.append('tva', data.vat || 0);
+      // Calculate VAT amount if rate exists
+      const ttc = parseFloat(data.amount || 0);
+      const taxRate = parseFloat(data.tax_rate || data.vat || 0);
+      const vatAmount = (ttc * taxRate) / (100 + taxRate);
+
+      // Map Bot fields to standard API fields
+      form.append('ttc', ttc);
+      form.append('tva', taxRate);
+      form.append('total_tva', vatAmount.toFixed(3));
+      form.append('total_ttc', ttc);
+      
       form.append('notes', data.notes || data.description || '');
       form.append('category_name', data.category || 'General');
+      if (data.category_id) form.append('category_id', data.category_id);
       form.append('supplier_name', data.entity || 'General');
+      if (data.supplier_id) form.append('supplier_id', data.supplier_id);
       form.append('payment_method', data.payment_method || 'WhatsApp');
       form.append('date', data.date || new Date().toISOString().split('T')[0]);
 
@@ -366,7 +430,13 @@ class LaravelService {
       });
       return response.data;
     } catch (error) {
-      console.error('Laravel Hybrid Create Expense Error:', error.response?.data || error.message);
+      const errorData = error.response?.data;
+      console.error('Laravel Hybrid Create Expense Error:', errorData || error.message);
+      
+      // Pass the specific error message back to the controller
+      if (errorData && errorData.message && errorData.message.includes('limit')) {
+          return { success: false, message: errorData.message };
+      }
       throw error;
     }
   }
@@ -394,7 +464,11 @@ class LaravelService {
           });
           return response.data;
       } catch (error) {
-          console.error('Laravel Hybrid Statement Error:', error.response?.data || error.message);
+          const errorData = error.response?.data;
+          console.error('Laravel Hybrid Statement Error:', errorData || error.message);
+          if (errorData && errorData.message && errorData.message.includes('limit')) {
+              return { success: false, message: errorData.message };
+          }
           throw error;
       }
   }
@@ -426,7 +500,8 @@ class LaravelService {
           
           form.append('date', invoiceDateStr);
           form.append('due_date', dueDate.toISOString().split('T')[0]);
-          form.append('status', data.status || 'ISSUED');
+          const finalStatus = data.status ? (data.status.toUpperCase() === 'UNPAID' ? 'ISSUED' : data.status) : 'ISSUED';
+          form.append('status', finalStatus);
 
           // Add a default article so the invoice shows up in the dashboard sums
           const designation = data.notes || data.description || 'Professional Services';
@@ -455,7 +530,11 @@ class LaravelService {
           });
           return response.data;
       } catch (error) {
-          console.error('Laravel Hybrid Create Invoice Error:', error.response?.data || error.message);
+          const errorData = error.response?.data;
+          console.error('Laravel Hybrid Create Invoice Error:', errorData || error.message);
+          if (errorData && errorData.message && errorData.message.includes('limit')) {
+              return { success: false, message: errorData.message };
+          }
           throw error;
       }
   }

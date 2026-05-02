@@ -14,6 +14,11 @@ class StateService {
     if (currentState.data && currentState.data.languageChosen) {
         mergedData.languageChosen = true;
     }
+    // 🧠 Preserve document context memory
+    if (currentState.data && currentState.data.lastRecordId && !mergedData.lastRecordId) {
+        mergedData.lastRecordId = currentState.data.lastRecordId;
+        mergedData.lastRecordType = currentState.data.lastRecordType;
+    }
     
     userStates.set(phoneNumber, { state, data: mergedData, lang: currentState.lang || 'fr' });
   }
@@ -41,6 +46,11 @@ class StateService {
     // Preserve session flags
     if (currentState.data && currentState.data.languageChosen) {
         data.languageChosen = true;
+    }
+    // 🧠 Preserve document context memory
+    if (currentState.data && currentState.data.lastRecordId) {
+        data.lastRecordId = currentState.data.lastRecordId;
+        data.lastRecordType = currentState.data.lastRecordType;
     }
     
     userStates.set(phoneNumber, { state: 'IDLE', data, lang: currentState.lang || 'fr' });
