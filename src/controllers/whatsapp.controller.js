@@ -2353,17 +2353,17 @@ class WhatsAppController {
           let displayTotal = total;
           if (filters.field === 'clients') {
               displayTotal = reportData.total_clients_count || 0;
-              periodStr = (lang === 'fr' ? "Tout le temps" : "All Time"); // Always All-Time for clients
+              periodStr = (lang === 'fr' ? "Tout le temps" : "All Time"); 
           }
 
-          const suffix = (responseType === 'INTEGER' || filters.field === 'clients') ? '' : ' MAD';
+          const suffix = (responseType === 'INTEGER' || filters.field === 'clients') ? '' : ` ${t('currency', lang)}`;
           const formattedTotal = (responseType === 'INTEGER' || filters.field === 'clients') 
             ? displayTotal 
             : displayTotal.toLocaleString(lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
           // 🎨 PREMIUM MESSAGING: Clean & Direct SaaS Format
           const msg = `📊 *${l[fieldKey]}:* \`${formattedTotal}${suffix}\`\n` +
-                      `📅 *${lang === 'fr' ? 'Période' : 'Period'}:* \`${periodStr}\``;
+                      `📅 *${t('label_period', lang)}:* \`${periodStr}\``;
 
           return whatsappService.sendTextMessage(from, msg);
       }
@@ -2372,17 +2372,25 @@ class WhatsAppController {
       const status = null; 
       const localFilter = filters.field === 'unpaid' ? (r) => (r.status || "").toUpperCase() !== 'PAID' : null;
       
+      // For Unpaid requests, we want the full history (All Time) by default
+      let m = filters.month;
+      let y = filters.year;
+      if (filters.field === 'unpaid' && !filters.startDate && !filters.endDate) {
+          m = null;
+          y = null;
+      }
+
       if (filters.dataType === 'expenses') {
-        return this.handleListTransactions(from, 'exp', null, filters.month, filters.year, filters.startDate, filters.endDate, 1, filters.limit, status, localFilter);
+        return this.handleListTransactions(from, 'exp', null, m, y, filters.startDate, filters.endDate, 1, filters.limit, status, localFilter);
       } else if (filters.dataType === 'invoices') {
         // Only show General Alert if NO limit is provided
         if (filters.field === 'unpaid' && !filters.limit) {
-            const fmtTotal = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(stats.total_unpaid_sum || 0) + ' MAD';
+            const fmtTotal = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(stats.total_unpaid_sum || 0) + ` ${t('currency', state.lang)}`;
             await whatsappService.sendTextMessage(from, t('alert_unpaid_total', state.lang, { total: fmtTotal, count: stats.unpaidInvoicesCount }));
         }
-        return this.handleListTransactions(from, 'inv', null, filters.month, filters.year, filters.startDate, filters.endDate, 1, filters.limit, status, localFilter);
+        return this.handleListTransactions(from, 'inv', null, m, y, filters.startDate, filters.endDate, 1, filters.limit, status, localFilter);
       } else if (filters.dataType === 'all') {
-        return this.handleListTransactions(from, 'all', null, filters.month, filters.year, filters.startDate, filters.endDate, 1, filters.limit, status, localFilter);
+        return this.handleListTransactions(from, 'all', null, m, y, filters.startDate, filters.endDate, 1, filters.limit, status, localFilter);
       } else if ((filters.field === 'clients' || filters.field === 'suppliers' || !filters.field) && responseType === 'ARRAY') {
         const [clients, suppliers] = await Promise.all([
           laravelService.getClients(from),
@@ -2981,9 +2989,9 @@ class WhatsAppController {
               title = (state.lang === 'fr' ? 'Récents: ' : 'Recent Activity: ') + title;
               periodLabel = t('all_time', state.lang); // Correct the label since we are showing history
               
-              // Send a separate clarifying message so the user knows 'today' was empty
-              const periodName = (startDate && endDate && startDate === endDate) ? (state.lang === 'fr' ? "aujourd'hui" : "today") : (state.lang === 'fr' ? "cette période" : "this period");
-              await whatsappService.sendTextMessage(from, `ℹ️ ${state.lang === 'fr' ? `Aucune transaction trouvée pour ${periodName}. Voici vos activités récentes :` : `No transactions found for ${periodName}. Here is your recent activity instead:`}`);
+              // Send a separate clarifying message so the user knows exactly which period was empty
+              const searchedPeriod = (startDate && endDate && startDate === endDate) ? (state.lang === 'fr' ? "aujourd'hui" : "today") : periodLabel;
+              await whatsappService.sendTextMessage(from, `ℹ️ ${state.lang === 'fr' ? `Aucune transaction trouvée pour ${searchedPeriod}. Voici vos activités récentes :` : `No transactions found for ${searchedPeriod}. Here is your recent activity instead:`}`);
               fallbackSent = true;
           }
           
