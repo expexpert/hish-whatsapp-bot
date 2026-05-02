@@ -2291,8 +2291,8 @@ class WhatsAppController {
           if (filters.startDate && filters.endDate) {
               const start = new Date(filters.startDate);
               const end = new Date(filters.endDate);
-              const options = { month: 'short', day: 'numeric' };
-              periodStr = `${start.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-US', options)} - ${end.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-US', options)}`;
+              const options = { year: 'numeric', month: 'short', day: 'numeric' };
+              periodStr = `${start.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-GB', options)} - ${end.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-GB', options)}`;
           }
           
           const labels = {

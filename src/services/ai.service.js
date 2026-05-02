@@ -574,9 +574,11 @@ class AIService {
             2. "last month" = 2026-04-01 to 2026-04-30.
             3. "this week" = The current Monday to Sunday. (Since today is Friday May 1, this week is 2026-04-27 to 2026-05-03).
             4. "last week" = The previous Monday to Sunday. (Since today is Friday May 1, last week is 2026-04-20 to 2026-04-26).
-            5. "second last week" = The Monday to Sunday before that (2026-04-13 to 2026-04-19).
-            6. "yesterday" = ${new Date(new Date().setDate(new Date().getDate() - 1)).toISOString().split('T')[0]}.
+            5. "yesterday" = ${new Date(new Date().setDate(new Date().getDate() - 1)).toISOString().split('T')[0]}.
+            6. "today" = ${today}.
 
+            CRITICAL: If the user asks for "week", "day", "yesterday", or "today", you MUST populate "startDate" and "endDate" with exact YYYY-MM-DD values and set "month" and "year" to null.
+            
             STRICT RULE: A week ALWAYS starts on Monday and ends on Sunday. 
 
             RETURN JSON ONLY:
