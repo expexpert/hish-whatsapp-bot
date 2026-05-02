@@ -581,6 +581,7 @@ class AIService {
             CRITICAL: If the user asks for "week", "day", "yesterday", or "today", you MUST populate "startDate" and "endDate" with exact YYYY-MM-DD values and set "month" and "year" to null.
             STRICT RULE: All financial totals MUST be calculated based on the 'Document Date' (legal date), NOT the entry date.
             
+            STRICT RULE: If the user says "for [name]" or "[name] invoices" or "invoices of [name]", you MUST extract "[name]" as the "entityName", even if it is lowercase (e.g., "test", "apple", "amazon").
             STRICT RULE: A week ALWAYS starts on Monday and ends on Sunday. 
 
             RETURN JSON ONLY:
