@@ -576,8 +576,10 @@ class AIService {
             4. "last week" = The previous Monday to Sunday. (Since today is Friday May 1, last week is 2026-04-20 to 2026-04-26).
             5. "yesterday" = ${new Date(new Date().setDate(new Date().getDate() - 1)).toISOString().split('T')[0]}.
             6. "today" = ${today}.
+            7. DEFAULT BEHAVIOR: If no specific time (today, week, etc.) is mentioned for financial totals (Revenue, VAT, Expenses), you MUST default to the current month (2026-05-01 to 2026-05-31) to ensure consistency across all languages.
 
             CRITICAL: If the user asks for "week", "day", "yesterday", or "today", you MUST populate "startDate" and "endDate" with exact YYYY-MM-DD values and set "month" and "year" to null.
+            STRICT RULE: All financial totals MUST be calculated based on the 'Document Date' (legal date), NOT the entry date.
             
             STRICT RULE: A week ALWAYS starts on Monday and ends on Sunday. 
 
