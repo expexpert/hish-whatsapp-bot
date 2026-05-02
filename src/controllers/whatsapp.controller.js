@@ -2945,6 +2945,8 @@ class WhatsAppController {
       const startIndex = (page - 1) * recordsPerPage;
       const pagedList = transactions.slice(startIndex, startIndex + (hasMore ? recordsPerPage : pageSize));
 
+      const isUnpaidList = status === 'UNPAID' || (localFilter && localFilter.toString().includes('PAID'));
+      
       // 4. Calculate Total Sum (On the final filtered list)
       let totalSum = 0;
       let currency = 'MAD';
@@ -2952,11 +2954,25 @@ class WhatsAppController {
           let amount = 0;
           if (transaction.bot_type === 'inv') {
               const articles = transaction.articles || transaction.items || transaction.invoice_products || [];
-              amount = articles.reduce((sum, art) => {
-                  const ht = parseFloat(art.total_price_ht || art.price_ht || 0);
-                  const disc = parseFloat(art.discount || 0);
-                  return sum + (ht - disc);
+              const ht = articles.reduce((sum, art) => {
+                  const p = parseFloat(art.total_price_ht || art.price_ht || 0);
+                  const d = parseFloat(art.discount || 0);
+                  return sum + (p - d);
               }, 0);
+              
+              if (isUnpaidList) {
+                  // For Unpaid lists, sum up the TTC (Total Net Payable)
+                  const tva = articles.reduce((sum, art) => {
+                      const p = parseFloat(art.total_price_ht || art.price_ht || 0);
+                      const d = parseFloat(art.discount || 0);
+                      const r = parseFloat(art.tva_percentage || 0); // Note: This assumes simple rate, which is fine for summary
+                      return sum + ((p - d) * (r / 100));
+                  }, 0);
+                  amount = ht + tva;
+              } else {
+                  amount = ht;
+              }
+              
               if (amount === 0) amount = parseFloat(transaction.amount || transaction.total || 0);
           } else {
               amount = parseFloat(transaction.total_ttc || transaction.ttc || transaction.amount || 0);
@@ -3115,7 +3131,11 @@ class WhatsAppController {
       const notesText = (rawNotes && String(rawNotes).toLowerCase() !== 'null') ? rawNotes : 'N/A';
       const vatLabel = state.lang === 'fr' ? 'TVA' : 'VAT';
       const isUnpaid = (document.status || "").toUpperCase() === 'ISSUED';
-      const htLabel = isUnpaid ? t('total_pending', state.lang) : `Total ${type === 'inv' ? 'HT' : 'TTC'}`;
+      const htLabelKey = isUnpaid ? 'label_ht_amount' : 'label_total_ht';
+      const ttcLabelKey = isUnpaid ? 'total_pending' : 'label_total_ttc';
+      
+      const htLabel = t(htLabelKey, state.lang);
+      const ttcLabel = t(ttcLabelKey, state.lang);
 
       // Human-friendly status mapping
       let displayStatus = document.status || t('recorded_successfully_short', state.lang);
@@ -3130,7 +3150,7 @@ class WhatsAppController {
                           `🏢 *${entityLabelText}:* ${entityName}\n` +
                           `💰 *${htLabel}:* ${fmtHT}\n` +
                           `📉 *${vatLabel} (${tvaRate}%):* ${fmtVat}\n` +
-                          `💵 *Total TTC:* ${fmtTTC}\n` +
+                          `💵 *${ttcLabel}:* ${fmtTTC}\n` +
                           `📅 *${t('field_date', state.lang)}:* ${date}\n` +
                           `📝 *${t('field_notes', state.lang)}:* ${notesText}\n` +
                           `━━━━━━━━━━━━━━━━━━\n` +
