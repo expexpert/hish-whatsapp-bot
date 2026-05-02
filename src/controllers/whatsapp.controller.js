@@ -2230,23 +2230,9 @@ class WhatsAppController {
           filters.dataType = 'invoices';
       }
 
-      // 🔄 ALL TIME DETECTION: If user asks for 'total', 'all time' OR 'unpaid' without a date, override date filters
-      const allTimeKeywords = (t('keywords_all_time', state.lang) || "").split(',').map(k => k.trim()).filter(k => k.length > 0);
-      const isAllTimeExplicit = allTimeKeywords.some(k => textLower.includes(k));
-      const isUnpaidSearch = filters.field === 'unpaid' || textLower.includes('unpaid') || textLower.includes('impay');
-      const isAllTime = isAllTimeExplicit || isUnpaidSearch;
-      
-      // 🕵️ DOUBLE SAFETY: If user asked for 'week' but AI only gave 'month', force clear filters to allow range detection
-      const isWeekSearch = textLower.includes('week') || textLower.includes('semaine');
-      
-      // Force clear filters if it's an All-Time search or Week search, even if AI pre-filled them
-      if ((isAllTime || isWeekSearch) && !text.match(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|janv|fév|mars|avr|mai|juin|juil|août|sept|oct|nov|déc)\b/i)) {
-          filters.month = null;
-          filters.year = null;
-          filters.startDate = null;
-          filters.endDate = null;
-          logger.debug(`🕒 [TIME OVERRIDE] "All Time" or "Week" forced. Clearing pre-filled date filters.`);
-      }
+      // 🔄 ALL TIME DETECTION: If user asks for 'all time' OR 'unpaid' without a date, let AI handle it.
+      // Removed aggressive manual overrides as AI is now reliable for date extraction.
+
 
       // 📅 MANUAL WEEK FALLBACK: If AI missed the dates for a week search, calculate them here
       if (isWeekSearch && !filters.startDate) {
