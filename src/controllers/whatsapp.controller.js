@@ -2530,7 +2530,10 @@ class WhatsAppController {
       })
     ];
 
-    if (combined.length === 0) return;
+    if (combined.length === 0) {
+        return whatsappService.sendTextMessage(from, t('no_results_found', lang));
+    }
+
 
     // Use buttons if few matches, otherwise use a List Message
     if (combined.length <= 3 && !isGlobal) {

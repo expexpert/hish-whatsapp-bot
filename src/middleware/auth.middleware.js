@@ -38,7 +38,8 @@ const verifyMetaSignature = (req, res, next) => {
     return res.status(401).send('Signature mismatch');
   }
   
-  console.log('🛡️  Signature Verified Successfully');
+  // Signature verified
+
   next();
 };
 
