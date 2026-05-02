@@ -2563,7 +2563,12 @@ class WhatsAppController {
                 description: item.id.startsWith('rep_c_') ? (lang === 'fr' ? "Client" : "Customer") : (lang === 'fr' ? "Fournisseur" : "Supplier")
             }))
         }];
-        const body = isGlobal ? (lang === 'fr' ? "Voici la liste de vos clients et fournisseurs enregistrés." : "Here is the list of your registered clients and suppliers.") : t('disambiguation_title', lang, { name: filters?.entityName || 'Search' });
+        let body = t('disambiguation_title', lang, { name: filters?.entityName || 'Search' });
+        if (isGlobal) {
+            if (filters.field === 'clients') body = t('list_title_clients', lang);
+            else if (filters.field === 'suppliers') body = t('list_title_suppliers', lang);
+            else body = t('list_title_all', lang);
+        }
         await whatsappService.sendInteractiveList(from, body, (lang === 'fr' ? "Voir Tout" : "View All"), sections);
     }
     
