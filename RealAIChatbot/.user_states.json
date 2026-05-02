@@ -1,0 +1,14 @@
+{
+  "919304220627": {
+    "state": "AWAITING_INVOICE_CREATION_CONFIRMATION",
+    "data": {
+      "languageChosen": true,
+      "draft": {
+        "name": "Mr Smith",
+        "amount": 3000,
+        "reason": "website development"
+      }
+    },
+    "lang": "en"
+  }
+}

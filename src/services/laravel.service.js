@@ -241,12 +241,15 @@ class LaravelService {
       });
 
       const data = response.data.data || {};
-      const currentYear = year || new Date().getFullYear();
-      const monthNum = month || String(new Date().getMonth() + 1).padStart(2, '0');
+      const currentYear = year || null;
+      const monthNum = month || null;
       
       // Calculate localized month name
-      const dateObj = new Date(currentYear, parseInt(monthNum) - 1, 1);
-      const localizedMonth = dateObj.toLocaleString(lang === 'fr' ? 'fr-FR' : 'en-US', { month: 'long', year: 'numeric' });
+      let localizedMonth = (lang === 'fr' ? "Tout le temps" : "All Time");
+      if (currentYear && monthNum) {
+          const dateObj = new Date(currentYear, parseInt(monthNum) - 1, 1);
+          localizedMonth = dateObj.toLocaleString(lang === 'fr' ? 'fr-FR' : 'en-US', { month: 'long', year: 'numeric' });
+      }
 
       return {
         month: localizedMonth,

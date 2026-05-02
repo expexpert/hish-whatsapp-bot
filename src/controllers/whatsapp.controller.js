@@ -565,25 +565,31 @@ class WhatsAppController {
                 return;
             }
 
-            let feedback = t('record_saved_success', state.lang);
-            const path = require('path');
+            const expData = state.data.expenseData || {};
+            const resData = result.data || {};
             
-            if (state.data.receiptPath) {
-                const fileName = path.basename(state.data.receiptPath);
-                const isAudio = fileName.endsWith('.ogg');
-                
-                if (!isAudio) {
-                    feedback += "\n" + t('sync_success_msg', state.lang);
-                    if (result.data && (result.data.download_url || result.data.id)) {
-                        const downloadUrl = result.data.download_url || `${laravelService.publicUrl}/api/bot/file/${result.data.id}`;
-                        feedback += `\n\n---\n📥 *${t('open_receipt', state.lang).toUpperCase()}*\n${downloadUrl}`;
-                    }
-                } else {
-                    feedback += "\n" + t('voice_processed_msg', state.lang);
-                }
-            } else {
-                feedback += "\n" + t('accountant_notified_msg', state.lang);
-            }
+            const amount = parseFloat(expData.amount !== undefined ? expData.amount : (resData.amount || resData.total_ttc || 0));
+            const currency = expData.currency || resData.currency || 'MAD';
+            const fmtAmount = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + currency;
+            const date = resData.date ? new Date(resData.date).toLocaleDateString(state.lang === 'fr' ? 'fr-FR' : 'en-GB') : 'N/A';
+
+            // VAT Discovery for Expenses
+            const tvaRate = parseFloat(expData.tva_percentage !== undefined ? expData.tva_percentage : (resData.tax_rate || resData.tva_percentage || 0));
+            const total_ht = amount / (1 + (tvaRate / 100));
+            const tvaAmount = amount - total_ht;
+            const fmtVat = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(tvaAmount) + ' ' + currency;
+            const vatLabel = state.lang === 'fr' ? 'TVA' : 'VAT';
+
+            const feedback = `🧾 *${t('expense_recorded_header', state.lang) || t('invoice_recorded_header', state.lang)}*\n` +
+                             `━━━━━━━━━━━━━━━━━━\n` +
+                             `🏢 *${t('field_entity_supplier', state.lang)}:* ${resData.entity || expData.entity || 'N/A'}\n` +
+                             `💰 *${t('field_amount', state.lang)}:* ${fmtAmount}\n` +
+                             `📉 *${vatLabel} (${tvaRate}%):* ${fmtVat}\n` +
+                             `📅 *${t('field_date', state.lang)}:* ${date}\n` +
+                             `📝 *${t('field_notes', state.lang)}:* ${resData.notes || resData.description || 'N/A'}\n` +
+                             `━━━━━━━━━━━━━━━━━━\n` +
+                             `💰 *${t('status_payment', state.lang)}:* ${t('status_' + String(resData.status || 'paid').toLowerCase(), state.lang)}\n` +
+                             `👀 *${t('status_review', state.lang)}:* ${t('status_' + String(resData.review_status || 'pending').toLowerCase(), state.lang)}`;
             
             // 1. Send Success Text FIRST
             await whatsappService.sendTextMessage(from, feedback);
@@ -723,23 +729,23 @@ class WhatsAppController {
                         
                         // Calculate total from articles (consistent with list logic)
                         const articles = result.data.articles || result.data.items || result.data.invoice_products || [];
-                        const amount = articles.reduce((sum, art) => sum + parseFloat(art.total_price_ht || art.price_ht || 0), 0) || parseFloat(result.data.total_ttc || result.data.amount || 0);
-                        const currency = result.data.currency || state.data.invoiceData.currency || 'MAD';
+                        const invData = state.data.invoiceData || {};
+                        const resData = result.data || {};
+                        const amount = parseFloat(invData.amount !== undefined ? invData.amount : (resData.amount || 0));
+                        const currency = invData.currency || resData.currency || 'MAD';
                         
                         const fmtAmount = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + currency;
-                        const entityName = result.data.client_name || state.data.invoiceData.client_name || result.data.entity || 'N/A';
+                        const entityName = invData.client_name || resData.client_name || resData.entity || 'N/A';
                         
-                        // Universal VAT Discovery (Prioritize Combined Mathematical Consistency)
-                        const resData = result.data || {};
-                        const tvaRate = parseFloat(resData.tax_rate || resData.tva_percentage || resData.tax_percentage || state.data.invoiceData.tva_percentage || 0);
+                        const tvaRate = parseFloat(invData.tva_percentage !== undefined ? invData.tva_percentage : (resData.tax_rate || resData.tva_percentage || 0));
 
-                        // Calculate Expected VAT based on the final HT amount
-                        const amountHT = articles.reduce((sum, art) => sum + parseFloat(art.total_price_ht || art.price_ht || 0), 0) || parseFloat(result.data.amount || 0);
+                        // Calculate Expected VAT based on the verified session HT amount
+                        const amountHT = amount;
                         let tvaAmount = amountHT * (tvaRate / 100);
                         
-                        // Fallback: If calculation is 0, attempt to pull from backend fields (but math is preferred)
-                        if (tvaAmount === 0) {
-                            tvaAmount = parseFloat(resData.tax_amount || resData.total_tva || resData.total_tax || resData.tax_price || 0);
+                        // Fallback: If calculation is 0, attempt to pull from backend fields (but session math is preferred)
+                        if (tvaAmount === 0 && resData.tax_amount) {
+                            tvaAmount = parseFloat(resData.tax_amount || resData.total_tva || 0);
                         }
                         
                         const fmtVat = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(tvaAmount) + ' ' + currency;
@@ -753,7 +759,8 @@ class WhatsAppController {
                                             `📅 *${t('field_date', state.lang)}:* ${date}\n` +
                                             `📝 *${t('field_notes', state.lang)}:* ${result.data.notes || result.data.description || 'N/A'}\n` +
                                             `━━━━━━━━━━━━━━━━━━\n` +
-                                            `✅ *Status:* ${t('recorded_successfully', state.lang)}`;
+                                            `💰 *${t('status_payment', state.lang)}:* ${t('status_' + String(result.data.status || 'issued').toLowerCase(), state.lang)}\n` +
+                                            `👀 *${t('status_review', state.lang)}:* ${t('status_' + String(result.data.review_status || 'pending').toLowerCase(), state.lang)}`;
 
                         // Force the delivery of the text receipt immediately to bypass any Ngrok/Media Meta drops
                         if (successText) {
@@ -1089,8 +1096,15 @@ class WhatsAppController {
             const tvaId = (interactiveId && String(interactiveId).startsWith('vat_')) ? String(interactiveId).replace('vat_', '') : null;
             if (tvaId) {
                 dataObj.tva_id = parseInt(tvaId);
+                // Proactively resolve rate so acknowledgement has it immediately
+                const taxMatch = await this.resolveTaxFromId(from, tvaId);
+                if (taxMatch) {
+                    dataObj.tva_percentage = parseFloat(taxMatch.rate);
+                    dataObj.tax_rate = parseFloat(taxMatch.rate);
+                    dataObj.tax_name = taxMatch.name;
+                }
             } else {
-                // Smart Text fallback: Ignore timestamps from copy-pasted messages
+                // Smart Text fallback
                 let rate = NaN;
                 const rateMatch = text.match(/Rate:\s*([0-9.]+)/i) || text.match(/(?:^|\s)([0-9]+(?:\.[0-9]+)?)(?:%|\s|$)/);
                 if (rateMatch) {
@@ -1100,7 +1114,9 @@ class WhatsAppController {
                 }
 
                 if (!isNaN(rate)) {
-                    dataObj.vat = rate; // Let the routing resolve it to an ID
+                    dataObj.vat = rate; 
+                    dataObj.tva_percentage = rate;
+                    dataObj.tax_rate = rate;
                 }
             }
             await stateService.setUserState(from, state.state, state.data);
@@ -1417,11 +1433,6 @@ class WhatsAppController {
     // --- 3. NORMALIZATION & FUZZY LOOKUP ---
     const sanitize = (val) => val ? String(val).toLowerCase().replace(/[.!]$/, '').trim() : '';
     
-    // Default Status if missing
-    if (!mergedData.status || invalidVals.includes(String(mergedData.status).toLowerCase())) {
-        mergedData.status = (mergedData.documentType === 'INVOICE') ? 'UNPAID' : 'PAID';
-    }
-    
     // A. Proactive Tax Resolution (Resolve text rates to DB IDs immediately)
     if (!mergedData.tva_id && (mergedData.vat !== null && mergedData.vat !== undefined)) {
         const taxMatch = await this.resolveTaxFromRate(from, mergedData.vat, mergedData.amount);
@@ -1606,6 +1617,9 @@ class WhatsAppController {
             }
             stateService.setUserState(from, 'AWAITING_EXPENSE_VAT', { expenseData: exp, receiptPath: filePath });
             await this.sendVatSelectionList(from);
+        } else if (!exp.status || invalidVals.includes(String(exp.status).toLowerCase())) {
+            stateService.setUserState(from, 'AWAITING_EXPENSE_STATUS', { expenseData: exp, receiptPath: filePath });
+            await this.sendExpenseStatusButtons(from);
         } else {
             stateService.setUserState(from, 'AWAITING_EXPENSE_CONFIRMATION', { expenseData: exp, receiptPath: filePath });
             await this.sendExpenseReviewButtons(from, exp, filePath);
@@ -3251,6 +3265,21 @@ class WhatsAppController {
   }
 
   /**
+   * Helper to resolve a tax rate from a database ID
+   */
+  async resolveTaxFromId(from, taxId) {
+    try {
+        const resources = await laravelService.getTaxes(from);
+        if (!resources || !resources.tax) return null;
+        const match = resources.tax.find(t => parseInt(t.id) === parseInt(taxId));
+        return match ? { id: match.id, rate: match.rate, name: match.name } : null;
+    } catch (err) {
+        logger.error('❌ Error in resolveTaxFromId:', err);
+        return null;
+    }
+  }
+
+  /**
    * Helper to find a database Tax ID based on a raw percentage rate (e.g. 20)
    * Hardened with Smart Math to detect rates from absolute VAT amounts.
    */
@@ -3391,6 +3420,26 @@ class WhatsAppController {
         return name.replace(/VAT/gi, 'TVA');
     }
     return name;
+  }
+
+  async sendInvoiceStatusButtons(from) {
+    const state = await stateService.getUserState(from);
+    const body = t('invoice_status_prompt', state.lang);
+    const buttons = [
+      { id: 'paid', title: t('status_paid', state.lang) },
+      { id: 'issued', title: t('status_issued', state.lang) }
+    ];
+    return whatsappService.sendInteractiveButtons(from, body, buttons);
+  }
+
+  async sendExpenseStatusButtons(from) {
+    const state = await stateService.getUserState(from);
+    const body = t('expense_status_prompt', state.lang);
+    const buttons = [
+      { id: 'paid', title: t('status_paid', state.lang) },
+      { id: 'unpaid', title: t('status_unpaid', state.lang) }
+    ];
+    return whatsappService.sendInteractiveButtons(from, body, buttons);
   }
 }
 

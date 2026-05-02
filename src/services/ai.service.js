@@ -593,7 +593,7 @@ class AIService {
                 "dataType": "expenses" | "invoices" | "general",
                 "responseType": "BIT" | "INTEGER" | "DECIMAL" | "ARRAY" | "ACTION",
                 "isYesNo": boolean,
-                "field": "vat" | "revenue" | "expenses" | "unpaid" | null,
+                "field": "vat" | "revenue" | "expenses" | "unpaid" | "clients" | null,
                 "limit": number | null,
                 "identifiers": {
                     "invoiceNumber": string | null,
@@ -602,6 +602,9 @@ class AIService {
                     "date": string | null
                 }
             }
+            CRITICAL: If the user asks for "all time", you MUST set "month" and "year" to null.
+            CRITICAL: If the user asks for "today", "yesterday", or a specific date, you MUST populate "startDate" and "endDate" and set "month" to null.
+            CRITICAL: Keywords like "unpaid", "pending", "vat", "revenue", "clients" MUST populate the "field" key.
             `;
 
             const completion = await this.openai.chat.completions.create({
