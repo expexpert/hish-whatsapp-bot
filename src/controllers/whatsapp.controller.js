@@ -575,8 +575,8 @@ class WhatsAppController {
 
             // VAT Discovery for Expenses
             const tvaRate = parseFloat(expData.tva_percentage !== undefined ? expData.tva_percentage : (resData.tax_rate || resData.tva_percentage || 0));
-            const total_ht = amount / (1 + (tvaRate / 100));
-            const tvaAmount = amount - total_ht;
+            const final_ht = amount / (1 + (tvaRate / 100));
+            const tvaAmount = amount - final_ht;
             const fmtVat = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(tvaAmount) + ' ' + currency;
             const vatLabel = state.lang === 'fr' ? 'TVA' : 'VAT';
 
