@@ -2519,12 +2519,12 @@ class WhatsAppController {
 
     const combined = [
       ...matchedClients.map(c => {
-          const name = c.client_name.trim();
+          const name = (c.client_name || c.name || "Unnamed Client").trim();
           const idSuffix = counts[name] > 1 ? ` #${c.id}` : "";
           return { id: `rep_c_${c.id}`, title: `C: ${name}${idSuffix}`.substring(0, 24) };
       }),
       ...matchedSuppliers.map(s => {
-          const name = s.name.trim();
+          const name = (s.supplier_name || s.company_name || s.name || "Unnamed Supplier").trim();
           const idSuffix = counts[name] > 1 ? ` #${s.id}` : "";
           return { id: `rep_s_${s.id}`, title: `S: ${name}${idSuffix}`.substring(0, 24) };
       })
