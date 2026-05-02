@@ -2383,7 +2383,7 @@ class WhatsAppController {
         return this.handleListTransactions(from, 'inv', null, filters.month, filters.year, filters.startDate, filters.endDate, 1, filters.limit, status, localFilter);
       } else if (filters.dataType === 'all') {
         return this.handleListTransactions(from, 'all', null, filters.month, filters.year, filters.startDate, filters.endDate, 1, filters.limit, status, localFilter);
-      } else if ((filters.field === 'clients' || filters.field === 'suppliers') && responseType === 'ARRAY') {
+      } else if ((filters.field === 'clients' || filters.field === 'suppliers' || !filters.field) && responseType === 'ARRAY') {
         const [clients, suppliers] = await Promise.all([
           laravelService.getClients(from),
           laravelService.getSuppliers(from)

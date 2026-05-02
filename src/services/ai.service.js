@@ -582,8 +582,9 @@ class AIService {
             STRICT RULE: All financial totals MUST be calculated based on the 'Document Date' (legal date), NOT the entry date.
             
             STRICT RULE: If the user says "for [name]" or "[name] invoices" or "invoices of [name]", you MUST extract "[name]" as the "entityName", even if it is lowercase (e.g., "test", "apple", "amazon").
-            STRICT RULE: If the user says "show everyone", "all contacts", "list directory", or "my people", you MUST set "field" to "clients" and "responseType" to "ARRAY".
-            STRICT RULE: If the user says "suppliers" or "vendors", set "field" to "suppliers". If they say "clients" or "customers", set "field" to "clients".
+            STRICT RULE: If the user says "show everyone", "all contacts", "list directory", or "my people", you MUST set "field" to null and "responseType" to "ARRAY".
+            STRICT RULE: If the user says "suppliers" or "vendors", set "field" to "suppliers" and "responseType" to "ARRAY".
+            STRICT RULE: If the user says "clients" or "customers", set "field" to "clients" and "responseType" to "ARRAY".
             STRICT RULE: A week ALWAYS starts on Monday and ends on Sunday. 
 
             RETURN JSON ONLY:
