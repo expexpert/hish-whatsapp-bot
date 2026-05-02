@@ -2486,7 +2486,12 @@ class WhatsAppController {
             }
         };
         const l = labels[lang] || labels.en;
-        const periodStr = (filters.startDate && filters.endDate) ? `${filters.startDate} - ${filters.endDate}` : `${monthName} ${filters.year}`;
+        const monthNames = {
+            en: ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"],
+            fr: ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
+        };
+        const mName = filters.month ? (monthNames[lang] ? monthNames[lang][filters.month - 1] : monthNames.en[filters.month - 1]) : (lang === 'fr' ? "Tout le temps" : "All Time");
+        const periodStr = (filters.startDate && filters.endDate) ? `${filters.startDate} - ${filters.endDate}` : `${mName} ${filters.year}`;
 
         if (responseType === 'INTEGER') {
           let count = stats.totalDocuments;
@@ -2495,7 +2500,9 @@ class WhatsAppController {
           else if (filters.dataType === 'expenses') { count = stats.expensesCount; fieldKey = 'expenses_count'; }
           else if (filters.dataType === 'invoices') { count = stats.invoicesCount; fieldKey = 'invoices_count'; }
           
-          return whatsappService.sendTextMessage(from, `📊 *${l[fieldKey]} (${periodStr}):* ${count}`);
+          const msg = `📊 *${l[fieldKey]}:* \`${count}\`\n` +
+                      `📅 *${lang === 'fr' ? 'Période' : 'Period'}:* \`${periodStr}\``;
+          return whatsappService.sendTextMessage(from, msg);
         }
         
         if (responseType === 'DECIMAL') {
@@ -2508,7 +2515,9 @@ class WhatsAppController {
           else if (filters.field === 'unpaid') { sum = stats.total_unpaid_sum; fieldKey = 'unpaid'; }
           
           const formatted = new Intl.NumberFormat(lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(sum);
-          return whatsappService.sendTextMessage(from, `📊 *${l[fieldKey]} (${periodStr}):* ${formatted} ${state.currency || 'MAD'}`);
+          const msg = `📊 *${l[fieldKey]}:* \`${formatted} ${state.currency || 'MAD'}\`\n` +
+                      `📅 *${lang === 'fr' ? 'Période' : 'Period'}:* \`${periodStr}\``;
+          return whatsappService.sendTextMessage(from, msg);
         }
       }
 
