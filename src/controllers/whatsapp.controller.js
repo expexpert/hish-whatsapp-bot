@@ -1093,7 +1093,9 @@ class WhatsAppController {
             const dataObj = isInvoice ? state.data.invoiceData : state.data.expenseData;
             const path = isInvoice ? state.data.filePath : state.data.receiptPath;
 
-            const tvaId = (interactiveId && String(interactiveId).startsWith('vat_')) ? String(interactiveId).replace('vat_', '') : null;
+            const tvaId = (interactiveId && (String(interactiveId).startsWith('set_vat_') || String(interactiveId).startsWith('vat_'))) 
+                ? String(interactiveId).replace('set_vat_', '').replace('vat_', '') 
+                : null;
             if (tvaId) {
                 dataObj.tva_id = parseInt(tvaId);
                 // Proactively resolve rate so acknowledgement has it immediately
