@@ -596,7 +596,7 @@ class AIService {
                 "dataType": "expenses" | "invoices" | "general",
                 "responseType": "BIT" | "INTEGER" | "DECIMAL" | "ARRAY" | "ACTION",
                 "isYesNo": boolean,
-                "field": "vat" | "revenue" | "expenses" | "unpaid" | "clients" | null,
+                "field": "vat" | "revenue" | "expenses" | "unpaid" | "clients" | "suppliers" | null,
                 "limit": number | null,
                 "identifiers": {
                     "invoiceNumber": string | null,
