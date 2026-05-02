@@ -2919,6 +2919,7 @@ class WhatsAppController {
       }
 
       // 1b. Smart Fallback: If list is empty AFTER filtering, show ALL recent items
+      let fallbackSent = false;
       if (transactions.length === 0 && (startDate || month)) {
           logger.debug(`⚠️ NO TRANSACTIONS for period. Falling back to all-time recent.`);
           if (type === 'all') {
@@ -2933,13 +2934,17 @@ class WhatsAppController {
           } else {
               transactions = await laravelService.getExpenses(from);
           }
-          transactions = transactions.slice(0, 5); // Just show the top 5 most recent ever
-          title = (state.lang === 'fr' ? 'Récents: ' : 'Recent Activity: ') + title;
-          periodLabel = t('all_time', state.lang); // Correct the label since we are showing history
           
-          // Send a separate clarifying message so the user knows 'today' was empty
-          const periodName = (startDate && endDate && startDate === endDate) ? (state.lang === 'fr' ? "aujourd'hui" : "today") : (state.lang === 'fr' ? "cette période" : "this period");
-          await whatsappService.sendTextMessage(from, `ℹ️ ${state.lang === 'fr' ? `Aucune transaction trouvée pour ${periodName}. Voici vos activités récentes :` : `No transactions found for ${periodName}. Here is your recent activity instead:`}`);
+          if (transactions.length > 0) {
+              transactions = transactions.slice(0, 5); // Just show the top 5 most recent ever
+              title = (state.lang === 'fr' ? 'Récents: ' : 'Recent Activity: ') + title;
+              periodLabel = t('all_time', state.lang); // Correct the label since we are showing history
+              
+              // Send a separate clarifying message so the user knows 'today' was empty
+              const periodName = (startDate && endDate && startDate === endDate) ? (state.lang === 'fr' ? "aujourd'hui" : "today") : (state.lang === 'fr' ? "cette période" : "this period");
+              await whatsappService.sendTextMessage(from, `ℹ️ ${state.lang === 'fr' ? `Aucune transaction trouvée pour ${periodName}. Voici vos activités récentes :` : `No transactions found for ${periodName}. Here is your recent activity instead:`}`);
+              fallbackSent = true;
+          }
           
           logger.debug(`🔍 [TRANSACTION LIST] Fallback complete. New count: ${transactions.length}`);
       }
@@ -2950,6 +2955,7 @@ class WhatsAppController {
       }
 
       if (transactions.length === 0) {
+        if (fallbackSent) return; // Stop if we already sent an empty-fallback message
         return whatsappService.sendTextMessage(from, t('no_transactions_found', state.lang));
       }
 
