@@ -2296,7 +2296,12 @@ class WhatsAppController {
               const start = new Date(filters.startDate);
               const end = new Date(filters.endDate);
               const options = { year: 'numeric', month: 'short', day: 'numeric' };
-              periodStr = `${start.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-GB', options)} - ${end.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-GB', options)}`;
+              
+              if (filters.startDate === filters.endDate) {
+                  periodStr = start.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-GB', options);
+              } else {
+                  periodStr = `${start.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-GB', options)} - ${end.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-GB', options)}`;
+              }
           }
           
           const labels = {
@@ -2332,6 +2337,7 @@ class WhatsAppController {
           let displayTotal = total;
           if (filters.field === 'clients') {
               displayTotal = reportData.total_clients_count || 0;
+              periodStr = (lang === 'fr' ? "Tout le temps" : "All Time"); // Always All-Time for clients
           }
 
           const suffix = (responseType === 'INTEGER' || filters.field === 'clients') ? '' : ' MAD';
@@ -2939,6 +2945,17 @@ class WhatsAppController {
       // 3. Apply Limit if provided (e.g., "last 5")
       if (limit && limit > 0) {
           transactions = transactions.slice(0, limit);
+      }
+
+      // 3.5 Calculate Result-Based Period (Ensure cross-language consistency)
+      if (transactions.length > 0 && !fallbackSent) {
+          const dates = transactions.map(t => new Date(t.date || t.issue_date || t.created_at)).filter(d => !isNaN(d));
+          if (dates.length > 0) {
+              const minDate = new Date(Math.min(...dates)).toISOString().split('T')[0];
+              const maxDate = new Date(Math.max(...dates)).toISOString().split('T')[0];
+              periodLabel = (minDate === maxDate) ? minDate : `${minDate} to ${maxDate}`;
+              logger.debug(`📅 [RESULT PERIOD] Calculated range: ${periodLabel}`);
+          }
       }
 
       if (transactions.length === 0) {
