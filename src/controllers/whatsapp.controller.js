@@ -574,7 +574,7 @@ class WhatsAppController {
             const date = resData.date ? new Date(resData.date).toLocaleDateString(state.lang === 'fr' ? 'fr-FR' : 'en-GB') : 'N/A';
 
             // VAT Discovery for Expenses
-            const tvaRate = parseFloat(expData.tva_percentage !== undefined ? expData.tva_percentage : (resData.tax_rate || resData.tva_percentage || 0));
+            const tvaRate = parseFloat(expData.tva_percentage || expData.tax_rate || resData.tax_rate || resData.tva_percentage || 0);
             const final_ht = amount / (1 + (tvaRate / 100));
             const tvaAmount = amount - final_ht;
             const fmtVat = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(tvaAmount) + ' ' + currency;
@@ -737,7 +737,7 @@ class WhatsAppController {
                         const fmtAmount = new Intl.NumberFormat(state.lang === 'fr' ? 'fr-FR' : 'en-US', { minimumFractionDigits: 2 }).format(amount) + ' ' + currency;
                         const entityName = invData.client_name || resData.client_name || resData.entity || 'N/A';
                         
-                        const tvaRate = parseFloat(invData.tva_percentage !== undefined ? invData.tva_percentage : (resData.tax_rate || resData.tva_percentage || 0));
+                        const tvaRate = parseFloat(invData.tva_percentage || invData.tax_rate || resData.tax_rate || resData.tva_percentage || 0);
 
                         // Calculate Expected VAT based on the verified session HT amount
                         const amountHT = amount;
