@@ -22,6 +22,18 @@ class WhatsAppController {
    * String similarity helper (Dice's Coefficient / Bigram)
    * Returns a score between 0.0 and 1.0
    */
+  formatHumanDate(dateStr, lang = 'en') {
+      if (!dateStr || dateStr === 'N/A') return 'N/A';
+      try {
+          const d = new Date(dateStr);
+          if (isNaN(d.getTime())) return dateStr;
+          const options = { day: 'numeric', month: 'short', year: 'numeric' };
+          return d.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-GB', options);
+      } catch (e) {
+          return dateStr;
+      }
+  }
+
   calculateSimilarity(str1, str2) {
       if (!str1 || !str2) return 0;
       const s1 = str1.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -2314,9 +2326,9 @@ class WhatsAppController {
               const options = { year: 'numeric', month: 'short', day: 'numeric' };
               
               if (filters.startDate === filters.endDate) {
-                  periodStr = start.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-GB', options);
+                  periodStr = this.formatHumanDate(filters.startDate, lang);
               } else {
-                  periodStr = `${start.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-GB', options)} - ${end.toLocaleDateString(lang === 'fr' ? 'fr-FR' : 'en-GB', options)}`;
+                  periodStr = `${this.formatHumanDate(filters.startDate, lang)} - ${this.formatHumanDate(filters.endDate, lang)}`;
               }
           }
           
@@ -2491,7 +2503,7 @@ class WhatsAppController {
             fr: ["Janvier", "Février", "Mars", "Avril", "Mai", "Juin", "Juillet", "Août", "Septembre", "Octobre", "Novembre", "Décembre"]
         };
         const mName = filters.month ? (monthNames[lang] ? monthNames[lang][filters.month - 1] : monthNames.en[filters.month - 1]) : (lang === 'fr' ? "Tout le temps" : "All Time");
-        const periodStr = (filters.startDate && filters.endDate) ? `${filters.startDate} - ${filters.endDate}` : `${mName} ${filters.year}`;
+        const periodStr = (filters.startDate && filters.endDate) ? (filters.startDate === filters.endDate ? this.formatHumanDate(filters.startDate, lang) : `${this.formatHumanDate(filters.startDate, lang)} - ${this.formatHumanDate(filters.endDate, lang)}`) : `${mName} ${filters.year || ''}`.trim();
 
         if (responseType === 'INTEGER') {
           let count = stats.totalDocuments;
@@ -3021,9 +3033,9 @@ class WhatsAppController {
       if (transactions.length > 0 && !fallbackSent) {
           const dates = transactions.map(t => new Date(t.date || t.issue_date || t.created_at)).filter(d => !isNaN(d));
           if (dates.length > 0) {
-              const minDate = new Date(Math.min(...dates)).toISOString().split('T')[0];
-              const maxDate = new Date(Math.max(...dates)).toISOString().split('T')[0];
-              periodLabel = (minDate === maxDate) ? minDate : `${minDate} to ${maxDate}`;
+              const minDateStr = new Date(Math.min(...dates)).toISOString().split('T')[0];
+              const maxDateStr = new Date(Math.max(...dates)).toISOString().split('T')[0];
+              periodLabel = (minDateStr === maxDateStr) ? this.formatHumanDate(minDateStr, state.lang) : `${this.formatHumanDate(minDateStr, state.lang)} - ${this.formatHumanDate(maxDateStr, state.lang)}`;
               logger.debug(`📅 [RESULT PERIOD] Calculated range: ${periodLabel}`);
           }
       }
@@ -3086,7 +3098,7 @@ class WhatsAppController {
 
       const rows = pagedList.map((transaction) => {
         const rawDate = transaction.date || transaction.issue_date || transaction.created_at;
-        const date = rawDate ? new Date(rawDate).toLocaleDateString(state.lang === 'fr' ? 'fr-FR' : 'en-GB') : 'N/A';
+        const date = this.formatHumanDate(rawDate, state.lang);
         
         let amount = 0;
         if (type === 'inv') {
@@ -3175,7 +3187,7 @@ class WhatsAppController {
       }
 
       const rawDate = document.date || document.issue_date || document.created_at;
-      const date = rawDate ? new Date(rawDate).toLocaleDateString('en-GB') : 'N/A';
+      const date = this.formatHumanDate(rawDate, state.lang);
       
       // Fetch tax resources to map ID to rate (Bot-Side API Map)
       const taxResources = await laravelService.getTaxes(from);

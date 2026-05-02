@@ -61,6 +61,7 @@ class WhatsAppService {
    * Note: This only works if you have an active 24h window
    */
   async sendTextMessage(to, text) {
+      if (!text || String(text).toLowerCase() === 'null') return;
       const url = `${this.baseUrl}/${this.phoneNumberId}/messages`;
       const payload = {
           messaging_product: 'whatsapp',
