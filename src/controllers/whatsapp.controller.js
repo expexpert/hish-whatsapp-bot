@@ -1684,11 +1684,11 @@ class WhatsAppController {
       ];
       const rowsClients = (clients || []).slice(0, 3).map(c => ({
           id: `rep_c_${c.id}`,
-          title: (c.company_name || c.client_name).substring(0, 24)
+          title: (c.company_name || c.client_name || 'Unknown').substring(0, 24)
       }));
       const rowsSuppliers = (suppliers || []).slice(0, 3).map(s => ({
           id: `rep_s_${s.id}`,
-          title: s.name.substring(0, 24)
+          title: (s.name || 'Unknown').substring(0, 24)
       }));
       
       const sections = [{ title: t('section_general_reports', state.lang), rows: rowsGeneral }];
